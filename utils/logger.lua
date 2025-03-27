@@ -2,6 +2,10 @@ local ffi = require("ffi")
 local uv = require("luv")
 local cjson = require("cjson.safe")
 
+ffi.cdef[[
+    int getpid();
+]]
+
 local LOG_FILE = "app.log"
 local MAX_LOG_SIZE = tonumber(os.getenv("MAX_LOG_SIZE") or "10485760") -- 10MB
 local BUFFER_FLUSH_INTERVAL = 5
@@ -106,7 +110,10 @@ end
 function Logger:rotateLogs()
     if self.log_fd then
         local fd = self.log_fd
-        self.log_fd = nil -- Mark as closed before reopening
+        self.log_fd = nil  -- Prevent new logs from writing
+
+        self:flushBuffer() -- Flush before rotation
+
         uv.fs_close(fd, function()
             os.rename(LOG_FILE, LOG_FILE .. ".old")
             self:openLogFile()
@@ -116,6 +123,7 @@ function Logger:rotateLogs()
         self:openLogFile()
     end
 end
+
 
 function Logger:flushBuffer()
     if #log_queue == 0 or not self.log_fd then return end
@@ -133,10 +141,16 @@ end
 function Logger:shutdown()
     shutdown_signal = true
     self:flushBuffer()
+    
     if self.log_fd then
-        uv.fs_close(self.log_fd)
+        local fd = self.log_fd
+        self.log_fd = nil -- Prevent further writes
+        uv.fs_close(fd, function()
+            print("[Logger] Shutdown complete. Logs flushed.")
+        end)
     end
 end
+
 
 function Logger:startAutoCleanup()
     uv.new_timer():start(60000, 60000, function()
