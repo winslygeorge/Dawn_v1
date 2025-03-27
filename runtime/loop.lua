@@ -1,153 +1,156 @@
-local ffi = require("ffi")
-local libuv = require("uv")
-local logger = require("logger") -- Placeholder for a proper logging library
-local monitoring = require("monitoring") -- Placeholder for a monitoring/alerting system
+package.path = package.path .. ";../?.lua;../utils/?.lua"
 
--- Define C function signatures for libuv
+local ffi = require("ffi")
+local luv = require("luv")
+local logger = require("utils.logger")
+
 ffi.cdef[[
 typedef void (*uv_walk_cb)(void* handle, void* arg);
 typedef struct { /* opaque */ } uv_loop_t;
 typedef struct { /* opaque */ } uv_timer_t;
 typedef struct { /* opaque */ } uv_async_t;
-typedef struct { const char* name; } timer_meta_t;
-
-int uv_loop_init(uv_loop_t* loop);
-int uv_run(uv_loop_t* loop, int mode);
-void uv_stop(uv_loop_t* loop);
-void uv_loop_close(uv_loop_t* loop);
-
-int uv_timer_init(uv_loop_t* loop, uv_timer_t* handle);
-int uv_timer_start(uv_timer_t* handle, void* cb, uint64_t delay, uint64_t repeat);
-int uv_timer_stop(uv_timer_t* handle);
-void uv_close(void* handle, void* close_cb);
-
-int uv_async_init(uv_loop_t* loop, uv_async_t* handle, void* async_cb);
-int uv_async_send(uv_async_t* handle);
 ]]
 
--- Supervisor restart and failure thresholds
-local MAX_RESTARTS = 5 -- Max restart attempts per child process
-local INITIAL_RESTART_BACKOFF = 1000 -- Initial delay before restarting a failed process (ms)
-local MAX_RESTART_BACKOFF = 60000 -- Maximum delay before restarting a failed process (ms)
-local SUPERVISOR_FAIL_THRESHOLD = 10 -- Max failures within a window before supervisor degrades
-local SUPERVISOR_FAIL_WINDOW = 60000 -- Time window for failure tracking (ms)
-local SUPERVISOR_RECOVERY_TIME = 300000 -- Time before supervisor attempts recovery (ms)
+-- Constants
+local MAX_RESTARTS = 5
+local INITIAL_RESTART_BACKOFF = 1000
+local MAX_RESTART_BACKOFF = 60000
+local CIRCUIT_BREAKER_THRESHOLD = 3
+local CIRCUIT_BREAKER_TIMEOUT = 120000  -- 2 minutes cooldown
+local FAILURE_EXPIRATION_TIME = 60000  -- 1 minute
 
--- Utility function to check libuv function return values and log errors
-local function uv_check(err, func_name, context)
-    if err < 0 then
-        local error_msg = string.format("%s failed in %s: %d", func_name, context or "unknown context", err)
-        logger.error(error_msg)
-        monitoring.alert("Critical", error_msg)
-        error(error_msg)
+local function luv_check(err, func_name, context)
+    if err then
+        local message = func_name .. " failed in " .. (context or "unknown") .. ": " .. err
+        logger:log("ERROR", message, "Supervisor")
+        return false
     end
-end
-
--- Cleanup function to ensure proper memory management
-local function close_callback(handle)
-    ffi.gc(handle, nil)
-end
-
--- Handles child process failures by logging errors and updating process state
-local function handle_child_failure(child, err)
-    local error_msg = string.format("Child process '%s' failed | Error: %s | State: %s | Restart Count: %d", child.name, err or "unknown", child.state, child.restart_count)
-    logger.error(error_msg)
-    monitoring.notify("warning", error_msg)
-    child.error = err
-    child.state = "failed"
+    return true
 end
 
 local Supervisor = {}
 Supervisor.__index = Supervisor
 
--- Function to restart a child process based on the supervisor's strategy
-function Supervisor:restartChild(child)
-    if self.degraded then return end
-    local restart_msg = string.format("Restarting child process: %s (Strategy: %s, Restart Count: %d)", child.name, self.strategy, child.restart_count)
-    logger.info(restart_msg)
-    monitoring.track("restart", restart_msg)
-    
-    -- Restart strategies:
-    -- 1. one_for_one: Restart only the failed child
-    -- 2. one_for_all: Restart all children when one fails
-    -- 3. rest_for_one: Restart the failed child and all subsequent children
-    if self.strategy == "one_for_all" then
-        logger.warn("[Supervisor]: Restarting all children due to failure in %s", child.name)
-        for _, c in ipairs(self.children) do
-            self:restartChildWithBackoff(c)
+function Supervisor:new(name, strategy)
+    local self = setmetatable({}, Supervisor)
+    self.name = name or "DefaultSupervisor"
+    self.strategy = strategy or "one_for_one"
+    self.children = {}
+    self.runningChildren = {}
+    self.failedProcesses = {}
+    self.degraded = false
+    self.circuitBreaker = false
+    self.state = "running"  -- Ensure state is initialized
+    return self
+end
+
+function Supervisor:logFailure(child)
+    local now = os.time() * 1000
+    self.failedProcesses[child.name] = self.failedProcesses[child.name] or {}
+
+    table.insert(self.failedProcesses[child.name], now)
+
+    -- Expire old failures
+    for i = #self.failedProcesses[child.name], 1, -1 do
+        if now - self.failedProcesses[child.name][i] > FAILURE_EXPIRATION_TIME then
+            table.remove(self.failedProcesses[child.name], i)
         end
-    elseif self.strategy == "rest_for_one" then
-        logger.warn("[Supervisor]: Restarting failed child and all after it due to %s", child.name)
-        local found = false
-        for _, c in ipairs(self.children) do
-            if found or c == child then
-                self:restartChildWithBackoff(c)
-                found = true
-            end
+    end
+
+    -- Circuit breaker activation
+    if #self.failedProcesses[child.name] >= CIRCUIT_BREAKER_THRESHOLD then
+        self.circuitBreaker = true
+        logger:log("WARN", "Circuit breaker activated for " .. child.name .. ". Cooldown: " .. CIRCUIT_BREAKER_TIMEOUT .. " ms", "Supervisor")
+
+        local timer = luv.new_timer()
+        if timer then
+            luv.timer_start(timer, CIRCUIT_BREAKER_TIMEOUT, 0, function()
+                self.circuitBreaker = false
+                logger:log("INFO", "Circuit breaker reset for " .. child.name, "Supervisor")
+            end)
+        else
+            logger:log("ERROR", "Failed to create circuit breaker timer", "Supervisor")
         end
-    else -- Default "one_for_one"
-        self:restartChildWithBackoff(child)
     end
 end
 
--- Function to restart a child process with an increasing backoff time
-function Supervisor:restartChildWithBackoff(child)
-    if self.degraded then return end
-    local restart_msg = string.format("Restarting child with backoff: %s (Current Backoff: %dms, Max: %dms)", child.name, child.backoff, child.maxBackoff)
-    logger.debug(restart_msg)
-    monitoring.track("restart_backoff", restart_msg)
-    
-    local timer = ffi.new("uv_timer_t")
-    ffi.gc(timer, function(handle)
-        libuv.uv_close(handle, ffi.cast("void (*)(void*)", close_callback))
-    end)
-    uv_check(libuv.uv_timer_init(self.loop, timer), "uv_timer_init", "Supervisor:restartChildWithBackoff")
+function Supervisor:restartChild(child)
+    if self.degraded or self.circuitBreaker then return end
 
-    local function timer_cb_c(handle)
+    local timer = luv.new_timer()
+    if not timer then
+        logger:log("ERROR", "Failed to create restart timer for " .. child.name, "Supervisor")
+        return
+    end
+
+    logger:log("DEBUG", "Restart timer created for " .. child.name, "Supervisor")
+
+    luv.timer_start(timer, child.backoff, 0, function()
+        if child.restart_count >= MAX_RESTARTS then
+            self:logFailure(child)
+            logger:log("ERROR", "Max restart attempts reached for " .. child.name, "Supervisor")
+            return
+        end
+
         local ok, err = child:restart()
         if ok then
             self.runningChildren[child] = true
             child.backoff = INITIAL_RESTART_BACKOFF
-            logger.info(string.format("Child '%s' restarted successfully", child.name))
+            logger:log("INFO", "Child " .. child.name .. " restarted successfully", "Supervisor")
         else
-            handle_child_failure(child, err)
-            self:logFailure()
-            monitoring.notify("critical", string.format("Child '%s' restart failed: %s", child.name, err))
-            if err == "Max restart limit reached" then
-                self:onFatalError(string.format("Child '%s' exceeded restart limit", child.name))
+            child.backoff = math.min(child.backoff * 2, MAX_RESTART_BACKOFF)
+            self:logFailure(child)
+            logger:log("ERROR", "Restart failed for " .. child.name .. ". Retrying in " .. child.backoff .. " ms", "Supervisor")
+
+            -- Schedule next retry using a new timer
+            local retryTimer = luv.new_timer()
+            if retryTimer then
+                logger:log("DEBUG", "Retry timer created for " .. child.name, "Supervisor")
+                luv.timer_start(retryTimer, child.backoff, 0, function()
+                    self:restartChild(child)
+                end)
             else
-                self:queueRestart(child)
-                child.backoff = math.min(child.backoff * 2, child.maxBackoff)
+                logger:log("ERROR", "Failed to create retry timer for " .. child.name, "Supervisor")
             end
         end
-        libuv.uv_timer_stop(handle)
+
+        -- Debugging: Check if timer is valid before stopping
+        if timer then
+            if luv.is_active(timer) then
+                logger:log("DEBUG", "Stopping timer for " .. child.name, "Supervisor")
+                luv.timer_stop(timer)
+            else
+                logger:log("WARN", "Timer for " .. child.name .. " was not active when trying to stop", "Supervisor")
+            end
+        else
+            logger:log("ERROR", "Timer was nil when trying to stop it for " .. child.name, "Supervisor")
+        end
+    end)
+end
+
+
+
+function Supervisor:stopChild(child)
+    if self.runningChildren[child] then
+        local success, err = child:stop()
+        if success then
+            self.runningChildren[child] = nil
+            logger:log("INFO", "Child " .. child.name .. " stopped", "Supervisor")
+        else
+            logger:log("ERROR", "Failed to stop child " .. child.name .. ": " .. tostring(err), "Supervisor")
+        end
     end
-
-    uv_check(libuv.uv_timer_start(timer, ffi.cast("void (*)(uv_timer_t*)", timer_cb_c), child.backoff, 0), "uv_timer_start", "Supervisor:restartChildWithBackoff")
 end
 
--- Handles critical supervisor failures and stops execution
-function Supervisor:onFatalError(err)
-    local error_msg = string.format("[Supervisor Fatal]: %s (Supervisor: %s, Running Children: %d)", err, self.name, #self.runningChildren)
-    logger.fatal(error_msg)
-    monitoring.alert("critical", error_msg)
-    self:stop()
-end
-
--- Stops the supervisor and all running child processes
 function Supervisor:stop()
     if self.state ~= "running" then return end
-    local stop_msg = string.format("Stopping supervisor: %s (Running Children: %d)", self.name, #self.runningChildren)
-    logger.warn(stop_msg)
-    monitoring.notify("info", stop_msg)
     self.state = "stopped"
+
     for _, child in ipairs(self.children) do
         self:stopChild(child)
     end
-    if self.asyncHandle then
-        libuv.uv_close(ffi.cast("void*", self.asyncHandle), ffi.cast("void (*)(void*)", close_callback))
-        self.asyncHandle = nil
-    end
+
+    logger:log("INFO", "Supervisor " .. self.name .. " stopped", "Supervisor")
 end
 
 return Supervisor

@@ -1,0 +1,4 @@
+{"timestamp":24352790660973,"source":"Supervisor","request_id":"N\/A","memory_usage":189.0048828125,"level":"ERROR","message":"Restart failed for Worker1. Retrying in 4000 ms"}
+{"timestamp":24352790688873,"source":"Supervisor","request_id":"N\/A","memory_usage":189.7861328125,"level":"WARN","message":"Timer for Worker1 was not active when trying to stop"}
+{"timestamp":24360797921364,"source":"Supervisor","request_id":"N\/A","memory_usage":194.4853515625,"level":"INFO","message":"Child Worker1 restarted successfully"}
+{"timestamp":24360797955164,"source":"Supervisor","request_id":"N\/A","memory_usage":195.1337890625,"level":"WARN","message":"Timer for Worker1 was not active when trying to stop"}
