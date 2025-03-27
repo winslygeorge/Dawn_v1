@@ -2,149 +2,150 @@ local ffi = require("ffi")
 local uv = require("luv")
 local cjson = require("cjson.safe")
 
--- Load system LZ4 library
-local lz4 = ffi.load("lz4")
-
-ffi.cdef[[
-int getpid();
-
-// LZ4 function definitions
-int LZ4_compress_default(const char* src, char* dst, int srcSize, int dstCapacity);
-int LZ4_decompress_safe(const char* src, char* dst, int compressedSize, int dstCapacity);
-int LZ4_compressBound(int inputSize);
-]]
-
-local LOG_FILE = "app.log.lz4"
-local MAX_LOG_SIZE = 10 * 1024 * 1024  -- 10MB
-local ROTATE_INTERVAL = 3600  -- 1 hour
-local BUFFER_FLUSH_INTERVAL = 5  -- Flush every 5 seconds
-local MAX_BUFFER_SIZE = 64 * 1024  -- 64KB before flushing
+local LOG_FILE = "app.log"
+local MAX_LOG_SIZE = tonumber(os.getenv("MAX_LOG_SIZE") or "10485760") -- 10MB
+local BUFFER_FLUSH_INTERVAL = 5
+local MAX_QUEUE_SIZE = 10000
 local LOG_LEVELS = { DEBUG = 1, INFO = 2, WARN = 3, ERROR = 4, FATAL = 5 }
-local MIN_LOG_LEVEL = LOG_LEVELS.INFO  -- Change this to filter logs
+local MIN_LOG_LEVEL = LOG_LEVELS.INFO
 
 local Logger = {}
 Logger.__index = Logger
 
+local log_queue = {}
+local log_worker_active = false
+local shutdown_signal = false
+
+local log_async = uv.new_async(function()
+    Logger.processLogQueue()
+end)
+
 function Logger:new()
     local obj = setmetatable({}, self)
-    obj.log_fd = nil
     obj.pid = ffi.C.getpid()
-    obj.buffer = {}
-    obj.buffer_size = 0
-    
-    -- Open log file
+    obj.thread_id = tostring(uv.thread_self())
+    obj.log_fd = nil
     obj:openLogFile()
-
-    -- Start time-based rotation
-    obj.timer = uv.new_timer()
-    obj.timer:start(ROTATE_INTERVAL * 1000, ROTATE_INTERVAL * 1000, function() obj:rotateLogFile() end)
-
-    -- Start buffer flushing timer
-    obj.flush_timer = uv.new_timer()
-    obj.flush_timer:start(BUFFER_FLUSH_INTERVAL * 1000, BUFFER_FLUSH_INTERVAL * 1000, function() obj:flushBuffer() end)
-
+    obj:startAutoCleanup()
     return obj
 end
 
 function Logger:openLogFile()
-    self.log_fd = uv.fs_open(LOG_FILE, "a+", 0x1A4)  -- O_APPEND | O_CREAT, mode 0644
+    uv.fs_open(LOG_FILE, "a+", 0x1A4, function(err, fd)
+        if err then
+            print("Failed to open log file:", uv.strerror(err))
+            return
+        end
+        self.log_fd = fd
+        if #log_queue > 0 then
+            log_async:send()
+        end
+    end)
+end
+
+function Logger:log(level, msg, source, request_id)
+    if not LOG_LEVELS[level] or LOG_LEVELS[level] < MIN_LOG_LEVEL then return end
     if not self.log_fd then
-        error("Failed to open log file: " .. LOG_FILE)
-    end
-end
-
-function Logger:checkLogSize()
-    local stat = uv.fs_stat(LOG_FILE)
-    if stat and stat.size >= MAX_LOG_SIZE then
-        self:rotateLogFile()
-    end
-end
-
-function Logger:rotateLogFile()
-    -- Close current log file
-    if self.log_fd then
-        uv.fs_close(self.log_fd)
-        self.log_fd = nil
+        self:openLogFile()
+        return
     end
 
-    -- Rename old log file with timestamp
-    local timestamp = os.date("%Y%m%d%H%M%S")
-    local archive_file = "app.log." .. timestamp .. ".lz4"
-    uv.fs_rename(LOG_FILE, archive_file)
-
-    -- Open a new log file
-    self:openLogFile()
-end
-
-function Logger:log(level, msg, source)
-    -- Ignore logs below the minimum level
-    if LOG_LEVELS[level] < MIN_LOG_LEVEL then return end
+    if #log_queue >= MAX_QUEUE_SIZE then
+        print("Log queue overflow! Dropping logs.")
+        return
+    end
 
     local entry = {
         timestamp = uv.hrtime(),
         level = level,
         message = msg,
         source = source or "unknown",
-        pid = self.pid
+        pid = self.pid,
+        thread_id = self.thread_id,
+        request_id = request_id or "N/A",
+        memory_usage = collectgarbage("count")
     }
 
-    local json_log = cjson.encode(entry) .. "\n"
-    table.insert(self.buffer, json_log)
-    self.buffer_size = self.buffer_size + #json_log
-
-    -- Flush if buffer reaches the limit
-    if self.buffer_size >= MAX_BUFFER_SIZE then
-        self:flushBuffer()
+    local json_log, json_err = cjson.encode(entry)
+    if not json_log then
+        print("JSON encode failed:", json_err)
+        return
     end
+
+    table.insert(log_queue, json_log .. "\n")
+    log_async:send()
 end
 
--- LZ4 Compression Function
-function Logger:compress(data)
-    local input_size = #data
-    local max_output_size = lz4.LZ4_compressBound(input_size)
-
-    -- Allocate memory for compressed output
-    local output = ffi.new("char[?]", max_output_size)
-
-    -- Perform compression
-    local compressed_size = lz4.LZ4_compress_default(data, output, input_size, max_output_size)
-    if compressed_size <= 0 then
-        error("LZ4 compression failed")
+function Logger.processLogQueue()
+    if #log_queue == 0 or shutdown_signal then
+        log_worker_active = false
+        return
     end
 
-    return ffi.string(output, compressed_size)
+    log_worker_active = true
+    local batch_logs = table.concat(log_queue)
+    log_queue = {}
+
+    uv.fs_stat(LOG_FILE, function(err, stat)
+        if not err and stat.size >= MAX_LOG_SIZE then
+            Logger:rotateLogs()
+        end
+
+        if Logger.log_fd then
+            uv.fs_write(Logger.log_fd, batch_logs, -1, function(write_err)
+                if write_err then
+                    print("Log write failed:", uv.strerror(write_err))
+                end
+            end)
+        else
+            print("Log file descriptor is nil, cannot write logs.")
+        end
+    end)
+end
+
+function Logger:rotateLogs()
+    if self.log_fd then
+        local fd = self.log_fd
+        self.log_fd = nil -- Mark as closed before reopening
+        uv.fs_close(fd, function()
+            os.rename(LOG_FILE, LOG_FILE .. ".old")
+            self:openLogFile()
+        end)
+    else
+        os.rename(LOG_FILE, LOG_FILE .. ".old")
+        self:openLogFile()
+    end
 end
 
 function Logger:flushBuffer()
-    if #self.buffer == 0 then return end
+    if #log_queue == 0 or not self.log_fd then return end
 
-    local batch_logs = table.concat(self.buffer)
-    local compressed_logs = self:compress(batch_logs)
+    local batch_logs = table.concat(log_queue)
+    log_queue = {}
 
-    -- Write compressed logs
-    uv.fs_write(self.log_fd, compressed_logs, -1)
-
-    self.buffer = {}
-    self.buffer_size = 0
-
-    self:checkLogSize()
+    uv.fs_write(self.log_fd, batch_logs, -1, function(err)
+        if err then
+            print("Final log flush failed:", uv.strerror(err))
+        end
+    end)
 end
 
-function Logger:close()
-    self:flushBuffer()  -- Ensure all logs are written before closing
+function Logger:shutdown()
+    shutdown_signal = true
+    self:flushBuffer()
     if self.log_fd then
         uv.fs_close(self.log_fd)
-        self.log_fd = nil
     end
 end
 
--- Initialize logger
-local logger = Logger:new()
+function Logger:startAutoCleanup()
+    uv.new_timer():start(60000, 60000, function()
+        uv.fs_stat(LOG_FILE, function(err, stat)
+            if not err and stat.size >= MAX_LOG_SIZE then
+                self:rotateLogs()
+            end
+        end)
+    end)
+end
 
-logger:log("DEBUG", "Buffered logging initialized.", "System")
-logger:log("INFO", "Application started successfully.", "Main")
-logger:log("WARN", "Low disk space detected.", "System")
-logger:log("ERROR", "Database connection failed.", "DB")
-logger:log("FATAL", "Critical failure, shutting down!", "Core")
-
-uv.run()
+return Logger
