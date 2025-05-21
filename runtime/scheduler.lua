@@ -3,6 +3,7 @@ package.path = package.path .. ";../?.lua;../utils/?.lua"
 local Scheduler = {}
 local luv = require("luv")
 local FibHeap = require("utils.fibheap") -- Fibonacci heap module (to be implemented separately)
+local log_level = require('utils.logger').LogLevel
 
 function Scheduler:new(maxQueueSize, logger)
     local obj = {
@@ -25,7 +26,7 @@ function Scheduler:add_task(id, func, delay, priority, retries, maxExecTime)
     if self.task_map[id] then return end -- Prevent duplicate tasks
     if self.queue:get_size() >= self.maxQueueSize then
         print("[Warning] Task queue is full! Dropping task:", id)
-        self.logger:log("WARN", "Task queue is full! Dropping task: ".. id, "Scheduler")
+        self.logger:log(log_level.WARN, "Task queue is full! Dropping task: ".. id, "Scheduler")
 
         return
     end
@@ -36,7 +37,7 @@ function Scheduler:add_task(id, func, delay, priority, retries, maxExecTime)
         exec_time = now + (delay or 0),
         priority = priority or 1,
         retries = retries or 3,
-        retry_attempts = 0,
+        retry_attempts = 10,
         maxExecTime = maxExecTime or 5,
         weight = 1 / (priority + 1)
     }
@@ -57,19 +58,19 @@ function Scheduler:execute_task(task)
 
     if not success then
         -- print("[Error] Task failed:", task.id, "-", err)
-        self.logger:log("ERROR", "Task failed: ".. task.id, "Scheduler")
+        self.logger:log(log_level.ERROR, "Task failed: ".. task.id, "Scheduler")
 
         task.retry_attempts = task.retry_attempts + 1
         if task.retry_attempts < task.retries then
             self:retry_task(task)
         else
             -- print("[Fail] Task permanently failed:", task.id)
-            self.logger:log("ERROR", "Task permanently failed: ".. task.id, "Scheduler")
+            self.logger:log(log_level.ERROR, "Task permanently failed: ".. task.id, "Scheduler")
 
         end
     elseif execDuration > task.maxExecTime then
         -- print("[Warning] Task", task.id, "exceeded max execution time!")
-        self.logger:log("WARN", "Task ".. task.id.." exceeded max execution time! ", "Scheduler")
+        self.logger:log(log_level.WARN, "Task ".. task.id.." exceeded max execution time! ", "Scheduler")
 
     end
 end
@@ -83,11 +84,9 @@ function Scheduler:extract_min()
 end
 
 function Scheduler:run_tasks()
-    local now = luv.now() / 1000
-    
-    while not self.queue:is_empty() and self.queue:find_min().exec_time <= now do
+    local now = luv.now() / 1000    while not self.queue:is_empty() and 
+    self.queue:find_min().exec_time <= now do
         local task = self:extract_min()
-
         -- Check if task has dependencies
         if self.dependencies[task.id] then
             local hasPendingDeps = false

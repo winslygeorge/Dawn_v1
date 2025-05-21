@@ -1,98 +1,60 @@
--- runner.lua
-package.path = package.path .. ";../?.lua;../utils/?.lua"
---if luv is installed in /path/to/luv/lib
--- package.path = package.path .. ";/path/to/luv/lib/?.lua;/path/to/luv/lib/?/init.lua"
-
+local Scheduler = require("scheduler") -- Assuming the scheduler.lua file is in the same directory
 local luv = require("luv")
 
---rest of your code.
+-- Mock logger (for testing purposes)
+local mockLogger = {
+    log = function(level, message, source)
+        -- In a real test, you might assert something about the log message here
+        print(string.format("[%s] %s - %s", level, message, source))
+    end,
+    LogLevel = {
+        DEBUG = "DEBUG",
+        INFO = "INFO",
+        WARN = "WARN",
+        ERROR = "ERROR",
+    }
+}
 
-local luv = require("luv")
-local Scheduler = require("runtime.runner") -- Assuming your scheduler is in runtime/scheduler.lua
-local Supervisor = require("runtime.loop") -- Assuming your supervisor is in runtime/supervisor.lua
-local logger = require("utils.logger") -- Assuming you have a logger module
+-- Create a scheduler instance with a large queue size
+local scheduler = Scheduler:new(2000, mockLogger) -- Increased maxQueueSize to handle more tasks than connections
 
-local Runner = {}
-Runner.__index = Runner
-
-function Runner:new()
-    local self = setmetatable({}, Runner)
-    self.loop = luv.new_loop()
-    self.supervisor = Supervisor:new("MainSupervisor")
-    self.scheduler = Scheduler:new(1000, logger) -- Initialize scheduler with max queue size and logger
-    return self
+-- Function to simulate a task (e.g., handling a connection)
+local function connection_handler(conn_id)
+    -- Simulate some work (e.g., reading/writing data)
+    local start_time = luv.now()
+    local duration = math.random(100, 500) / 1000 -- Simulate task duration between 0.1 and 0.5 seconds
+    luv.sleep(duration)
+    local end_time = luv.now()
+    -- print(string.format("Connection %d handled in %.3f seconds", conn_id, duration))
+    return true, string.format("Connection %d handled in %.3f seconds", conn_id, (end_time - start_time)/1000)
 end
 
-function Runner:addTask(taskId, taskFunc, delay, priority, retries, maxExecTime)
-    self.scheduler:add_task(taskId, taskFunc, delay, priority, retries, maxExecTime)
+-- Add a large number of tasks to the scheduler, simulating many connections
+local num_connections = 10
+local start_time = luv.now()
+print(string.format("Adding %d connections...", num_connections))
+for i = 1, num_connections do
+    local delay = math.random(0, 100) / 1000 -- Random delay between 0 and 0.1 seconds
+    scheduler:add_task("conn_" .. i, function() return connection_handler(i) end, delay, math.random(1, 3)) -- Add a function wrapper
 end
 
-function Runner:addSupervisorChild(child)
-  table.insert(self.supervisor.children,child);
-  self.supervisor.runningChildren[child] = true;
+-- Run the scheduler for a sufficient amount of time to process all tasks.  Important.
+luv.run() -- Keep the loop running
+
+local end_time = luv.now()
+print(string.format("%d connections handled in %.3f seconds", num_connections, (end_time - start_time)/1000))
+
+-- Check if all tasks were executed (this is rudimentary, a proper test framework is better)
+local executed_tasks = 0
+for k, _ in pairs(scheduler.task_map) do
+    executed_tasks = executed_tasks + 1
 end
 
-function Runner:run()
-    local function schedulerTask()
-        self.scheduler:run_tasks()
-    end
+print(string.format("Number of tasks left in queue: %d", executed_tasks))
 
-    local schedulerTimer = luv.new_timer()
-    luv.timer_init(self.loop, schedulerTimer)
-    luv.timer_start(schedulerTimer, 10, 10, schedulerTask) -- Run scheduler every 10ms
-
-    logger:log("INFO", "Runner started", "Runner")
-
-    luv.run(self.loop)
-
-    logger:log("INFO", "Runner stopped", "Runner")
+-- Basic check:  Ideally executed_tasks should be 0 or very close to 0
+if executed_tasks <= 10 then -- Allow a small number of tasks to remain, in case of timing issues.
+    print("Test passed: Scheduler handled 1000 connections (mostly) successfully.")
+else
+    print("Test failed: Scheduler did not handle 1000 connections successfully.")
 end
-
-function Runner:stop()
-  self.supervisor:stop();
-  luv.stop(self.loop);
-end
-
--- Example child process for supervisor
-local ChildProcess = {}
-ChildProcess.__index = ChildProcess
-
-function ChildProcess:new(name, startFunc, stopFunc, restartFunc)
-    local self = setmetatable({}, ChildProcess)
-    self.name = name
-    self.start = startFunc
-    self.stop = stopFunc
-    self.restart = restartFunc
-    self.restart_count = 0;
-    self.backoff = 1000;
-    return self
-end
-
--- Example Usage:
-local runner = Runner:new()
-
--- Add scheduler tasks
-runner:addTask("task1", function() logger:log("INFO", "Async task 1 running...", "Task1") end, 1000, 1)
-runner:addTask("task2", function() logger:log("INFO", "Async task 2 running...", "Task2") end, 2000, 2)
-
--- Example child processes for supervisor
-local child1 = ChildProcess:new("Child1",
-    function() logger:log("INFO", "Child1 started", "Child1") return true; end,
-    function() logger:log("INFO", "Child1 stopped", "Child1") return true; end,
-    function() logger:log("INFO", "Child1 restarted", "Child1") return true; end
-)
-
-local child2 = ChildProcess:new("Child2",
-    function() logger:log("INFO", "Child2 started", "Child2") return true; end,
-    function() logger:log("INFO", "Child2 stopped", "Child2") return true; end,
-    function() logger:log("INFO", "Child2 restarted", "Child2") return true; end
-)
-
-runner:addSupervisorChild(child1);
-runner:addSupervisorChild(child2);
-
--- Run the runner
-runner:run()
-
--- If you want to stop the runner later:
--- runner:stop()

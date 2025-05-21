@@ -1,0 +1,6 @@
+{"memory_usage":193.578125,"message":"Restarting child: Worker1","source":"Supervisor","pid":5633,"level":"INFO","request_id":"N\/A","thread_id":29318746560008,"timestamp":"2025-04-20T20:37:48Z"}
+{"memory_usage":194.65234375,"message":"Restart failed for Worker1. Retrying in 2000 ms","source":"Supervisor","pid":5633,"level":"ERROR","request_id":"N\/A","thread_id":29318746560008,"timestamp":"2025-04-20T20:37:48Z"}
+{"memory_usage":196.89453125,"message":"Restarting child: Worker2","source":"Supervisor","pid":5633,"level":"INFO","request_id":"N\/A","thread_id":29318746560008,"timestamp":"2025-04-20T20:37:48Z"}
+{"memory_usage":197.91796875,"message":"Restart failed for Worker2. Retrying in 2000 ms","source":"Supervisor","pid":5633,"level":"ERROR","request_id":"N\/A","thread_id":29318746560008,"timestamp":"2025-04-20T20:37:48Z"}
+{"memory_usage":199.90234375,"message":"Restarting child: Worker3","source":"Supervisor","pid":5633,"level":"INFO","request_id":"N\/A","thread_id":29318746560008,"timestamp":"2025-04-20T20:37:48Z"}
+{"memory_usage":200.98828125,"message":"Restart failed for Worker3. Retrying in 2000 ms","source":"Supervisor","pid":5633,"level":"ERROR","request_id":"N\/A","thread_id":29318746560008,"timestamp":"2025-04-20T20:37:48Z"}

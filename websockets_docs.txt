@@ -1,0 +1,16 @@
+how to declare on_message handler in example.lua
+
+local function on_message(ws, msg, conn_state, shared)
+    conn_state.state.last_pong = os.time()
+
+    if msg.type == "ping" then
+        ws:send('{"type":"pong"}')
+    elseif msg.type == "join_game" then
+        local uid = msg.user_id or "guest_" .. tostring(ws)
+        conn_state.user_id = uid
+        shared.players[uid] = ws
+        ws:send('{"type":"join_ack","user_id":"' .. uid .. '"}')
+    else
+        ws:send('{"error":"Unknown message type"}')
+    end
+end

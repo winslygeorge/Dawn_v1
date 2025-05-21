@@ -6,64 +6,105 @@ ffi.cdef[[
     int getpid();
 ]]
 
+local ENV = os.getenv("ENV") or "development"
+local is_dev = ENV == "development"
+
 local LOG_FILE = "app.log"
-local MAX_LOG_SIZE = tonumber(os.getenv("MAX_LOG_SIZE") or "10485760") -- 10MB
-local BUFFER_FLUSH_INTERVAL = 5
+local MAX_LOG_SIZE = 10 * 1024 * 1024 -- 10MB
 local MAX_QUEUE_SIZE = 10000
-local LOG_LEVELS = { DEBUG = 1, INFO = 2, WARN = 3, ERROR = 4, FATAL = 5 }
-local MIN_LOG_LEVEL = LOG_LEVELS.INFO
+local AUTO_FLUSH_INTERVAL = 5000 -- Auto-flush every 5 seconds (5000 ms)
+
+-- LogLevel Enum-like Table
+local LogLevel = {
+    DEBUG = 1,
+    INFO  = 2,
+    WARN  = 3,
+    ERROR = 4,
+    FATAL = 5
+}
+
+-- Reverse mapping for level -> name
+local levelNames = {
+    [1] = "DEBUG",
+    [2] = "INFO",
+    [3] = "WARN",
+    [4] = "ERROR",
+    [5] = "FATAL"
+}
+
+-- Adds a method to convert level number to string
+function LogLevel.toString(level)
+    return levelNames[level] or "UNKNOWN"
+end
+
+
+local COLORS = {
+    DEBUG = "\27[38;5;244m",
+    INFO  = "\27[38;5;34m",
+    WARN  = "\27[38;5;214m",
+    ERROR = "\27[38;5;196m",
+    FATAL = "\27[48;5;88;38;5;231m",
+    RESET = "\27[0m"
+}
+
+local ICONS = {
+    DEBUG = "🐞",
+    INFO  = "ℹ️ ",
+    WARN  = "⚠️ ",
+    ERROR = "❌",
+    FATAL = "💀"
+}
 
 local Logger = {}
 Logger.__index = Logger
 
-local log_queue = {}
-local log_worker_active = false
-local shutdown_signal = false
-
-local log_async = uv.new_async(function()
-    Logger.processLogQueue()
-end)
-
 function Logger:new()
     local obj = setmetatable({}, self)
     obj.pid = ffi.C.getpid()
-    obj.thread_id = tostring(uv.thread_self())
+    obj.thread_id = uv.hrtime()
     obj.log_fd = nil
+    obj.log_queue = {}
+    obj.log_worker_active = false
+    obj.shutdown_signal = false
+    obj.log_mode = "dev"
+    obj.min_level = LogLevel.INFO
+    obj.last_request_id = nil
+
+    obj.log_async = uv.new_async(function()
+        obj:processLogQueue()
+    end)
+
+    obj.auto_flush_timer = uv.new_timer()
     obj:openLogFile()
-    obj:startAutoCleanup()
+    obj:startAutoFlush()
     return obj
 end
 
+function Logger:setLogMode(mode)
+    self.log_mode = mode or "dev"
+end
+
 function Logger:openLogFile()
-    uv.fs_open(LOG_FILE, "a+", 0x1A4, function(err, fd)
-        if err then
-            print("Failed to open log file:", uv.strerror(err))
-            return
-        end
-        self.log_fd = fd
-        if #log_queue > 0 then
-            log_async:send()
-        end
-    end)
+    local fd, err = uv.fs_open(LOG_FILE, "a+", 420)
+    if not fd then
+        print("[Logger] Failed to open log file:", uv.strerror(err))
+        return
+    end
+    self.log_fd = fd
+    print("[Logger] Log file opened.")
 end
 
 function Logger:log(level, msg, source, request_id)
-    if not LOG_LEVELS[level] or LOG_LEVELS[level] < MIN_LOG_LEVEL then return end
-    if not self.log_fd then
-        self:openLogFile()
-        return
-    end
+    if level < self.min_level then return end
 
-    if #log_queue >= MAX_QUEUE_SIZE then
-        print("Log queue overflow! Dropping logs.")
-        return
-    end
+    local level_name = LogLevel.toString(level)
+    source = source or "unknown"
 
     local entry = {
-        timestamp = uv.hrtime(),
-        level = level,
+        timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+        level = level_name,
         message = msg,
-        source = source or "unknown",
+        source = source,
         pid = self.pid,
         thread_id = self.thread_id,
         request_id = request_id or "N/A",
@@ -72,94 +113,89 @@ function Logger:log(level, msg, source, request_id)
 
     local json_log, json_err = cjson.encode(entry)
     if not json_log then
-        print("JSON encode failed:", json_err)
+        print("[Logger] JSON encode failed:", json_err)
         return
     end
 
-    table.insert(log_queue, json_log .. "\n")
-    log_async:send()
+    table.insert(self.log_queue, json_log .. "\n")
+
+    if self.log_mode == "dev" then
+        local color = COLORS[level_name] or ""
+        local icon = ICONS[level_name] or ""
+        print(string.format("%s[%s] [%s] %s %s%s", color, entry.timestamp, level_name, icon, msg, COLORS.RESET))
+    end
+
+    if #self.log_queue >= MAX_QUEUE_SIZE then
+        self:flushBuffer()
+    elseif #self.log_queue >= 10 then
+        self:flushBuffer()
+    end
+
+    if not self.log_worker_active then
+        self.log_worker_active = true
+        self.log_async:send()
+    end
 end
 
-function Logger.processLogQueue()
-    if #log_queue == 0 or shutdown_signal then
-        log_worker_active = false
+function Logger:processLogQueue()
+    if self.shutdown_signal or #self.log_queue == 0 then
+        self.log_worker_active = false
         return
     end
 
-    log_worker_active = true
-    local batch_logs = table.concat(log_queue)
-    log_queue = {}
+    local batch_logs = table.concat(self.log_queue)
+    self.log_queue = {}
 
-    uv.fs_stat(LOG_FILE, function(err, stat)
-        if not err and stat.size >= MAX_LOG_SIZE then
-            Logger:rotateLogs()
-        end
+    if self.log_fd then
+        uv.fs_write(self.log_fd, batch_logs, -1, function(write_err)
+            if write_err then
+                print("[Logger] Log write failed:", uv.strerror(write_err))
+            end
+        end)
+    else
+        print("[Logger] Log file descriptor is nil, cannot write logs.")
+    end
+end
 
-        if Logger.log_fd then
-            uv.fs_write(Logger.log_fd, batch_logs, -1, function(write_err)
-                if write_err then
-                    print("Log write failed:", uv.strerror(write_err))
-                end
-            end)
-        else
-            print("Log file descriptor is nil, cannot write logs.")
+function Logger:flushBuffer()
+    if #self.log_queue == 0 or not self.log_fd then return end
+
+    local batch_logs = table.concat(self.log_queue)
+    self.log_queue = {}
+
+    uv.fs_write(self.log_fd, batch_logs, -1, function(err)
+        if err then
+            print("[Logger] Final log flush failed:", uv.strerror(err))
         end
     end)
 end
 
-function Logger:rotateLogs()
-    if self.log_fd then
-        local fd = self.log_fd
-        self.log_fd = nil  -- Prevent new logs from writing
-
-        self:flushBuffer() -- Flush before rotation
-
-        uv.fs_close(fd, function()
-            os.rename(LOG_FILE, LOG_FILE .. ".old")
-            self:openLogFile()
-        end)
-    else
-        os.rename(LOG_FILE, LOG_FILE .. ".old")
-        self:openLogFile()
-    end
-end
-
-
-function Logger:flushBuffer()
-    if #log_queue == 0 or not self.log_fd then return end
-
-    local batch_logs = table.concat(log_queue)
-    log_queue = {}
-
-    uv.fs_write(self.log_fd, batch_logs, -1, function(err)
-        if err then
-            print("Final log flush failed:", uv.strerror(err))
-        end
+function Logger:startAutoFlush()
+    self.auto_flush_timer:start(AUTO_FLUSH_INTERVAL, AUTO_FLUSH_INTERVAL, function()
+        self:flushBuffer()
     end)
 end
 
 function Logger:shutdown()
-    shutdown_signal = true
+    self.shutdown_signal = true
     self:flushBuffer()
-    
+
     if self.log_fd then
         local fd = self.log_fd
-        self.log_fd = nil -- Prevent further writes
+        self.log_fd = nil
         uv.fs_close(fd, function()
             print("[Logger] Shutdown complete. Logs flushed.")
         end)
     end
+
+    if self.auto_flush_timer then
+        self.auto_flush_timer:stop()
+        self.auto_flush_timer:close()
+        self.auto_flush_timer = nil
+    end
 end
 
-
-function Logger:startAutoCleanup()
-    uv.new_timer():start(60000, 60000, function()
-        uv.fs_stat(LOG_FILE, function(err, stat)
-            if not err and stat.size >= MAX_LOG_SIZE then
-                self:rotateLogs()
-            end
-        end)
-    end)
-end
-
-return Logger
+return {
+    Logger = Logger,
+    LogLevel = LogLevel
+}
