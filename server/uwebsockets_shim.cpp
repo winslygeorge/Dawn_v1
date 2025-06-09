@@ -9,11 +9,17 @@
 #include <functional>
 #include <string> // For std::to_string
 #include <sys/socket.h> // For sockaddr, sockaddr_storage
-#include <netdb.h>  
+#include <netdb.h>
 #include <random>     // Include for random number generation
 #include <sstream>    // Include for stringstream
-#include <iomanip> 
- // For getnameinfo, NI_MAXHOST, NI_NUMERICHOST
+#include <iomanip>
+#include <fstream>    // For file operations
+#include <filesystem> // For path manipulation (C++17)
+
+
+namespace fs = std::filesystem; // Alias for convenience
+
+// For getnameinfo, NI_MAXHOST, NI_NUMERICHOST
 
 static std::shared_ptr<uWS::App> app;
 static lua_State *main_L = nullptr;
@@ -358,32 +364,43 @@ int uw_put(lua_State *L) {
     lua_callbacks[callback_id] = ref;
 
     app->put(route, [callback_id, route](uWS::HttpResponse<false> *res_uws, uWS::HttpRequest *req_uws) {
-        std::string body;
-        res_uws->onData([callback_id, res_uws, &body, req_uws, route](std::string_view data, bool last) mutable {
-            body.append(data.data(), data.size());
-            if (last) {
-                std::lock_guard<std::mutex> lock(lua_mutex);
-                if (!execute_middleware(main_L, res_uws, req_uws, route)) return;
+        if (res_uws) {
+            std::shared_ptr<std::string> body = std::make_shared<std::string>();
 
-                lua_rawgeti(main_L, LUA_REGISTRYINDEX, lua_callbacks[callback_id]);
-                create_req_userdata(main_L, req_uws);
-                create_res_userdata(main_L, res_uws);
-                lua_pushlstring(main_L, body.data(), body.size());
+            res_uws->onData([callback_id, res_uws, req_uws, route, body](std::string_view data, bool last) mutable {
+                body->append(data.data(), data.size());
 
-                if (lua_pcall(main_L, 3, 0, 0) != LUA_OK) {
-                    std::cerr << "Lua error in PUT handler: " << lua_tostring(main_L, -1) << std::endl;
-                    lua_pop(main_L, 1);
-                    res_uws->writeHeader("Content-Type", "text/plain")->end("Internal Server Error");
+                if (last) {
+                    std::lock_guard<std::mutex> lock(lua_mutex);
+                    if (!execute_middleware(main_L, res_uws, req_uws, route)) return;
+
+                    lua_rawgeti(main_L, LUA_REGISTRYINDEX, lua_callbacks[callback_id]);
+                    create_req_userdata(main_L, req_uws);
+                    create_res_userdata(main_L, res_uws);
+                     lua_pushlstring(main_L, data.data(), data.size());
+                    lua_pushboolean(main_L, last);
+
+                    if (lua_pcall(main_L, 4, 0, 0) != LUA_OK) {
+                        std::cerr << "Lua error in PUT handler: " << lua_tostring(main_L, -1) << std::endl;
+                        lua_pop(main_L, 1);
+                        res_uws->writeHeader("Content-Type", "text/plain")->end("Internal Server Error");
+                    }
                 }
-            }
-        });
-        res_uws->onAborted([]() {
-            std::cerr << "PUT request aborted" << std::endl;
-        });
+            });
+
+            res_uws->onAborted([]() {
+                std::cerr << "PUT request aborted" << std::endl;
+            });
+
+        } else {
+            std::cerr << "Error: res_uws is NULL in PUT handler!" << std::endl;
+        }
     });
+
     lua_pushboolean(L, 1);
     return 1;
 }
+
 
 int uw_delete(lua_State *L) {
     const char *route = luaL_checkstring(L, 1);
@@ -499,81 +516,6 @@ int uw_options(lua_State *L) {
     return 1;
 }
 
-// int uw_ws(lua_State *L) {
-//     const char *route = luaL_checkstring(L, 1);
-//     luaL_checktype(L, 2, LUA_TFUNCTION);
-//     lua_pushvalue(L, 2);
-//     int ref = luaL_ref(L, LUA_REGISTRYINDEX);
-//     int callback_id = callback_id_counter++;
-//     lua_callbacks[callback_id] = ref;
-
-//     app->ws<DummyUserData>(route, {
-//         .open = [callback_id, route](auto *ws) {
-//             std::lock_guard<std::mutex> lock(lua_mutex);
-//             lua_rawgeti(main_L, LUA_REGISTRYINDEX, lua_callbacks[callback_id]);
-
-//             // Push the WebSocket userdata and set its metatable
-//             uWS::WebSocket<false, true, DummyUserData>** ws_ud = static_cast<uWS::WebSocket<false, true, DummyUserData>**>(lua_newuserdata(main_L, sizeof(uWS::WebSocket<false, true, DummyUserData>*)));
-//             *ws_ud = ws;
-//             luaL_getmetatable(main_L, "websocket");
-//             lua_setmetatable(main_L, -2);
-
-//             lua_pushstring(main_L, "open");
-
-//             if (lua_pcall(main_L, 2, 0, 0) != LUA_OK) {
-//                 std::cerr << "Lua error (open): " << lua_tostring(main_L, -1) << std::endl;
-//                 lua_pop(main_L, 1);
-//             }
-//         },
-
-//         .message = [callback_id](auto *ws, std::string_view message, uWS::OpCode opCode) {
-//             std::lock_guard<std::mutex> lock(lua_mutex);
-//             lua_rawgeti(main_L, LUA_REGISTRYINDEX, lua_callbacks[callback_id]);
-
-//             // Push the WebSocket userdata with metatable
-//             uWS::WebSocket<false, true, DummyUserData>** ws_ud = static_cast<uWS::WebSocket<false, true, DummyUserData>**>(lua_newuserdata(main_L, sizeof(uWS::WebSocket<false, true, DummyUserData>*)));
-//             *ws_ud = ws;
-//             luaL_getmetatable(main_L, "websocket");
-//             lua_setmetatable(main_L, -2);
-
-//             lua_pushstring(main_L, "message");
-//             lua_pushlstring(main_L, message.data(), message.size());
-
-//             if (lua_pcall(main_L, 3, 0, 0) != LUA_OK) {
-//                 std::cerr << "Lua error (message): " << lua_tostring(main_L, -1) << std::endl;
-//                 lua_pop(main_L, 1);
-//             }
-//         },
-
-//         .close = [callback_id](auto *ws, int code, std::string_view message) {
-//             std::lock_guard<std::mutex> lock(lua_mutex);
-//             lua_rawgeti(main_L, LUA_REGISTRYINDEX, lua_callbacks[callback_id]);
-
-//             // Push the WebSocket userdata with metatable
-//             uWS::WebSocket<false, true, DummyUserData>** ws_ud = static_cast<uWS::WebSocket<false, true, DummyUserData>**>(lua_newuserdata(main_L, sizeof(uWS::WebSocket<false, true, DummyUserData>*)));
-//             *ws_ud = ws;
-//             luaL_getmetatable(main_L, "websocket");
-//             lua_setmetatable(main_L, -2);
-
-//             lua_pushstring(main_L, "close");
-//             lua_pushinteger(main_L, code);
-//             lua_pushlstring(main_L, message.data(), message.size());
-
-//             if (lua_pcall(main_L, 4, 0, 0) != LUA_OK) {
-//                 std::cerr << "Lua error (close): " << lua_tostring(main_L, -1) << std::endl;
-//                 lua_pop(main_L, 1);
-//             }
-//         }
-//     });
-
-//     lua_pushboolean(L, 1);
-//     return 1;
-// }
-
-// Forward declaration (assuming these are defined elsewhere)
-
-
-
 // Function to generate a simple unique ID
 std::string generate_unique_id() {
     static std::random_device rd;
@@ -652,7 +594,7 @@ int uw_ws(lua_State *L) {
             if (lua_pcall(main_L, 4, 0, 0) != LUA_OK) {
                 std::cerr << "Lua error (message): " << lua_tostring(main_L, -1) << std::endl;
                 lua_pop(main_L, 1);
-            }            
+            }
         },
 
         .close = [callback_id](auto *ws, int code, std::string_view message) {
@@ -686,8 +628,168 @@ int uw_ws(lua_State *L) {
     return 1;
 }
 
-//...............................................................................................................................................................................................
+// Assuming fs, app, and other necessary includes/definitions are present
+// Assuming you have uWebSockets.h or similar for uWS::App and Response/Request types
+// #include "uWebSockets.h"
 
+// Assuming 'app' is globally available, e.g.:
+// uWS::App* app = nullptr;
+// namespace fs = std::filesystem; // Alias for std::filesystem
+
+// Helper function to get MIME type (assuming it's correct)
+std::string get_mime_type(const std::string& filepath) {
+    fs::path p(filepath);
+    std::string ext = p.extension().string();
+    if (ext == ".html" || ext == ".htm") return "text/html";
+    if (ext == ".css") return "text/css";
+    if (ext == ".js") return "application/javascript";
+    if (ext == ".json") return "application/json";
+    if (ext == ".jpg" || ext == ".jpeg") return "image/jpeg";
+    if (ext == ".png") return "image/png";
+    if (ext == ".gif") return "image/gif";
+    if (ext == ".svg") return "image/svg+xml";
+    if (ext == ".ico") return "image/x-icon";
+    if (ext == ".pdf") return "application/pdf";
+    if (ext == ".txt") return "text/plain";
+    return "application/octet-stream";
+}
+
+// New function to serve static files
+int uw_serve_static(lua_State *L) {
+    const char *route_prefix = luaL_checkstring(L, 1);
+    const char *dir_path = luaL_checkstring(L, 2);
+
+    std::cout << "[uw_serve_static] Registering static route: " << route_prefix
+              << " serving from directory: " << dir_path << std::endl;
+
+    if (!fs::is_directory(dir_path)) {
+        std::cerr << "ERROR: Static file directory '" << dir_path << "' does not exist or is not a directory." << std::endl;
+        lua_pushboolean(L, 0);
+        return 1;
+    }
+
+    std::string route_pattern = std::string(route_prefix) + "/*";
+
+    app->get(route_pattern.c_str(), [dir_path_str = std::string(dir_path), route_prefix_str = std::string(route_prefix)](auto *res, auto *req) {
+        std::string_view url = req->getUrl();
+        std::cout << "[Request] Incoming URL: " << url << std::endl;
+
+        std::string file_path_suffix = std::string(url.substr(route_prefix_str.length()));
+        if (!file_path_suffix.empty() && file_path_suffix[0] == '/') {
+            file_path_suffix.erase(0, 1);
+        }
+        std::cout << "[Request] Extracted file path suffix: " << file_path_suffix << std::endl;
+
+        if (file_path_suffix.find("..") != std::string::npos) {
+            std::cerr << "WARNING: Directory traversal attempt detected for: " << file_path_suffix << std::endl;
+            res->writeStatus("403 Forbidden")->end("Forbidden");
+            return;
+        }
+
+        fs::path full_path = fs::path(dir_path_str) / file_path_suffix;
+        std::cout << "[File Path] Constructed full path: " << full_path.string() << std::endl;
+
+        if (fs::is_directory(full_path)) {
+            std::cout << "[File Path] Path is a directory, appending index.html." << std::endl;
+            full_path /= "index.html";
+        }
+
+        if (fs::exists(full_path) && fs::is_regular_file(full_path)) {
+            auto file_stream_ptr = std::make_shared<std::ifstream>(full_path, std::ios::binary);
+
+            if (file_stream_ptr->is_open()) {
+                file_stream_ptr->seekg(0, std::ios::end);
+                size_t file_size = file_stream_ptr->tellg();
+                file_stream_ptr->seekg(0, std::ios::beg);
+
+                std::cout << "[File Open] File '" << full_path.string() << "' opened successfully. Size: " << file_size << " bytes." << std::endl;
+
+                std::string mime_type = get_mime_type(full_path.string());
+                res->writeHeader("Content-Type", mime_type);
+                res->writeHeader("Content-Length", std::to_string(file_size));
+                std::cout << "[Headers] Set Content-Type: " << mime_type << ", Content-Length: " << file_size << std::endl;
+
+                // Determine a reasonable max chunk size for a single write to avoid onWritable for small files
+                // UWS_MAX_SENDFILE_SIZE is not directly exposed to userland code like this.
+                // A common buffer size or even the system's socket buffer size can be a guide.
+                // Let's use 64KB as a heuristic for a "small" file that can be sent in one go.
+                const size_t SMALL_FILE_THRESHOLD = 64 * 1024; // 64 KB
+
+                if (file_size <= SMALL_FILE_THRESHOLD) {
+                    // Read the entire small file into a buffer and send it all at once
+                    std::vector<char> buffer(file_size);
+                    if (!file_stream_ptr->read(buffer.data(), file_size)) {
+                        std::cerr << "ERROR: Failed to read entire small file: " << full_path.string() << std::endl;
+                        res->writeStatus("500 Internal Server Error")->end("File Read Error");
+                        return;
+                    }
+                    std::cout << "[Small File] Sending entire file (" << file_size << " bytes) in one go." << std::endl;
+                    res->end(std::string_view(buffer.data(), file_size));
+                    // No need for onWritable or explicit res->write, res->end(data) sends it all.
+                } else {
+                    // File is large, use onWritable for chunking
+                    auto buffer_ptr = std::make_shared<std::vector<char>>(16 * 1024); // 16KB buffer for chunks
+
+                    res->onWritable([res, file_stream_ptr, buffer_ptr, remaining_bytes_captured = file_size](int offset) mutable {
+                        std::cout << "[onWritable] Called. Offset: " << offset << ", Remaining bytes (before this chunk): " << remaining_bytes_captured << std::endl;
+
+                        size_t chunk_to_read = std::min((size_t)offset, remaining_bytes_captured);
+
+                        if (chunk_to_read == 0) {
+                            std::cout << "[onWritable] No bytes to read in this chunk (chunk_to_read is 0)." << std::endl;
+                            if (remaining_bytes_captured == 0) {
+                                std::cout << "[onWritable] All bytes sent, calling res->end()." << std::endl;
+                                res->end(); // Important: End the response here if all is sent
+                            }
+                            return true; // Indicate that no more data is immediately available to write
+                        }
+
+                        if (!file_stream_ptr->read(buffer_ptr->data(), chunk_to_read)) {
+                            std::cerr << "ERROR: [onWritable] File read error or EOF unexpectedly! File: (Check if stream is still valid: " << file_stream_ptr->good() << ")" << std::endl;
+                            res->end(); // Attempt to gracefully close the response on read error
+                            return true; // Stop writing
+                        }
+
+                        remaining_bytes_captured -= chunk_to_read;
+                        res->write(std::string_view(buffer_ptr->data(), chunk_to_read));
+                        std::cout << "[onWritable] Wrote " << chunk_to_read << " bytes. Remaining: " << remaining_bytes_captured << std::endl;
+
+                        if (remaining_bytes_captured == 0) {
+                            std::cout << "[onWritable] Last chunk sent, calling res->end()." << std::endl;
+                            res->end(); // Important: End the response once all data is sent
+                        }
+                        return remaining_bytes_captured == 0; // Return true if done, false otherwise
+                    })->onAborted([file_stream_ptr, full_path_str = full_path.string()]() {
+                        std::cerr << "WARNING: Static file transfer aborted for '" << full_path_str << "'." << std::endl;
+                    });
+
+                    // Send the first chunk for large files
+                    size_t first_chunk_size = std::min(buffer_ptr->size(), file_size);
+                    if (first_chunk_size > 0) {
+                        std::cout << "[Initial Write] Sending first chunk of size: " << first_chunk_size << " for large file." << std::endl;
+                        if (!file_stream_ptr->read(buffer_ptr->data(), first_chunk_size)) {
+                             std::cerr << "ERROR: [Initial Write] File read error for first chunk of large file! File: " << full_path.string() << std::endl;
+                             res->end();
+                             return;
+                        }
+                        res->write(std::string_view(buffer_ptr->data(), first_chunk_size));
+                    }
+                    std::cout << "[Initial Write] More data to send. onWritable will continue for large file." << std::endl;
+                }
+
+            } else {
+                std::cerr << "ERROR: Could not open file for reading: " << full_path.string() << std::endl;
+                res->writeStatus("500 Internal Server Error")->end("Could not open file.");
+            }
+        } else {
+            std::cout << "[File Check] File not found or not a regular file: " << full_path.string() << std::endl;
+            res->writeStatus("404 Not Found")->end("Not Found");
+        }
+    });
+
+    lua_pushboolean(L, 1);
+    return 1;
+}
 int uw_listen(lua_State *L) {
     if (!app) {
         std::cerr << "Error: uWS::App not initialized." << std::endl;
@@ -733,6 +835,7 @@ extern "C" int luaopen_uwebsockets(lua_State *L) {
         {"listen", uw_listen},
         {"run", uw_run},
         {"use", uw_use},
+        {"serve_static", uw_serve_static}, // Add the new function
         {nullptr, nullptr}
     };
 

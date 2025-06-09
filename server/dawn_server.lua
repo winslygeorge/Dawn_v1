@@ -1,27 +1,20 @@
+-- dawn_server.lua
+
+package.cpath = package.cpath .. ";./?.so"
 local uws = require("uwebsockets")
 local Supervisor = require("runtime.loop")
 local json = require('cjson')
-local StreamingMultipartParser = require('multipart_parser') -- You are requiring this but not using it in the provided code
+local StreamingMultipartParser = require('multipart_parser')
 local uv = require("luv")
-local URLParamExtractor = require("utils.query_extractor") -- Replace "your_module_name"
+local URLParamExtractor = require("utils.query_extractor")
 local log_level = require('utils.logger').LogLevel
--- Require the dawn_sockets module
 local TokenCleaner = require("auth.token_cleaner")
 
-
--- Create an instance of the class
 local extractor = URLParamExtractor:new()
 
--- Initialize the server with configuration (optional)
 local function timestamp()
     return os.date("[%Y-%m-%d %H:%M:%S]")
 end
-
--- local Logger = {
---     log = function(level, message, name)
---         print(string.format("%s [%s] %s", timestamp(), level, name or "Logger"), message)
---     end
--- }
 
 local function extractHttpMethod(request_str)
     -- Extract the first line of the request
@@ -35,7 +28,6 @@ local function extractHttpMethod(request_str)
     end
     return "" -- if something fails
 end
-
 
 local TrieNode = {}
 
@@ -52,7 +44,6 @@ end
 function TrieNode:insert(method, route, handler)
     local node = self
     local parts = {}
-    -- Normalize route path to lowercase
     local normalizedRoute = route:lower()
     for part in normalizedRoute:gmatch("([^/]+)") do
         table.insert(parts, part)
@@ -120,7 +111,7 @@ function TrieNode:search(method, path)
     if node and node.isEndOfPath and node.handler and node.handler.method == method then
         return node.handler.func, params
     else
-        print("  Handler not found at end of path.") -- Added
+        print("  Handler not found at end of path.")
         return nil, {}
     end
 end
@@ -150,8 +141,9 @@ function DawnServer:new(config)
         players = {},
         metrics = {},
     }
+    -- New member to store static file configurations
+    self.static_configs = config.static_configs or {} -- <--- Add this line
 
-    -- Pass optional WebSocket handlers to DawnSockets
     local DawnSockets = require("server.dawn_sockets")
     self.dawn_sockets_handler = DawnSockets:new(self.supervisor, self.shared_state, self.config.state_management_options or {})
     if self.token_store.store then
@@ -161,10 +153,8 @@ function DawnServer:new(config)
         self.supervisor:startChild(cleaner)
     end
 
-    -- uv.run()
     return self
 end
-
 
 function DawnServer:on_error(error_type, handler)
     assert(error_type == "middleware" or error_type == "route", "Invalid error handler type. Must be 'middleware' or 'route'.")
@@ -177,7 +167,6 @@ function DawnServer:on_route_error(route, handler)
     assert(type(handler) == "function", "Route error handler must be a function.")
     self.error_handlers.route[route:lower()] = handler
 end
-
 
 function DawnServer:use(middleware, route)
     assert(type(middleware) == "function", "Middleware must be a function")
@@ -193,44 +182,48 @@ function DawnServer:addRoute(method, path, handler, opts)
         self.routes[method] = {}
     end
 
-    -- Register in flat list
     table.insert(self.routes[method], {
         path = path,
         handler = handler,
         opts = opts or {}
     })
 
-    -- ✅ Register into trie router (THIS IS WHAT YOU NEED)
     self.router:insert(method, path, handler)
 end
-
 
 function DawnServer:scope(prefix, func)
     table.insert(self.route_scopes, prefix)
     func(self)
-    table.remove(self.route_scopes)  -- Reset after scope ends
+    table.remove(self.route_scopes)
 end
 
 for _, method in ipairs({"get", "post", "put", "delete", "patch", "head", "options"}) do
     DawnServer[method] = function(self, route, handler)
-        -- Prepend the current scope prefix to the route
         local scoped_route = table.concat(self.route_scopes, "") .. route
         self:addRoute(method, scoped_route, handler)
     end
 end
 
 function DawnServer:ws(route, handler)
-    -- Prepend the current scope prefix to the route
     local scoped_route = table.concat(self.route_scopes, "") .. route
     self:addRoute("WS", scoped_route, handler)
 end
 
--- Query Parsing
+-- New function to add static file serving configuration
+function DawnServer:serveStatic(route_prefix, directory_path) -- <--- Add this function
+    assert(type(route_prefix) == "string", "Route prefix for static serving must be a string.")
+    assert(type(directory_path) == "string", "Directory path for static serving must be a string.")
+    table.insert(self.static_configs, {
+        route_prefix = route_prefix,
+        directory_path = directory_path
+    })
+end
+
+
 local function parseQuery(url)
     return extractor:extract_from_url_like_string(url)
 end
 
--- Route Debug Printer
 function DawnServer:printRoutes()
     self.logger:log(log_level.INFO, "Registered Routes:", "DawnServer")
     local function printNodeRoutes(node, prefix)
@@ -251,7 +244,7 @@ local function log_invisible_chars(str, label)
     local has_invisible = false
     local output = ""
     for i = 1, #str do
-        local byte = str:byte(i) -- More efficient way to get byte
+        local byte = str:byte(i)
         if byte < 32 or byte > 126 then
             has_invisible = true
             output = output .. string.format("[%d]", byte)
@@ -259,12 +252,11 @@ local function log_invisible_chars(str, label)
     end
     if has_invisible then
         print("DEBUG", label .. " contains invisible characters (byte codes): " .. output, "DawnServer")
-        else
-          print("label doens't have invisoblle characters")
+    else
+        print("label doesn't have invisible characters")
     end
 end
 
--- CORS Preflight Handling
 local function handleCORS(req, res)
     if req.method == "OPTIONS" then
         res:writeHeader("Access-Control-Allow-Origin", "*")
@@ -277,7 +269,6 @@ local function handleCORS(req, res)
     return true
 end
 
--- Graceful Shutdown
 local function setupGracefulShutdown(self)
     local sigint = uv.new_signal()
     uv.signal_start(sigint, "sigint", function()
@@ -326,13 +317,12 @@ local function executeMiddleware(self, req, res, route, middlewares, index)
     end
 end
 
--- In your DawnServer module (at the top)
 
 function DawnServer:run()
     if self.running then return end
     self.running = true
     uws.create_app()
-    local self_ref = self -- Capture self for use in callbacks
+    local self_ref = self
 
     local function decodeURIComponent(str)
         str = str:gsub('+', ' ')
@@ -342,37 +332,37 @@ function DawnServer:run()
         return str
     end
 
-    -- Handle routes and CORS
     local function handleRequest(_req, res, chunk, is_last)
         local path = _req:getUrl():match("^[^?]*")
-        -- Normalize path to remove trailing slash
         if path ~= "/" and path:sub(-1) == "/" then
             path = path:sub(1, -2)
         end
         local method = extractHttpMethod(_req.method)
-        -- print("method : ", method, " path : ", path, " chunk: ", chunk, " is_last: ", is_last)
+
+        -- Important: Before router.search, check if the request should be handled by static serving
+        -- This logic needs to be outside the route handler loop, handled by uWS itself
+        -- The C++ shim will handle this by registering the wildcard route `/static/*`
+
         local handler_info, params = self_ref.router:search(method, path)
-        local req = { -- Create a wrapper table
-            _raw = _req, -- Store the original uwebsockets req
+        local req = {
+            _raw = _req,
             params = params,
-            method = method -- Add the method to the request object
+            method = method
         }
         self_ref.logger:log(log_level.DEBUG, string.format("Method: %s, Path: %s, Handler Found: %s, Params: %s", method, path, tostring(handler_info ~= nil), json.encode(params)), "DawnServer")
 
-        if not handleCORS(req, res) then return end -- Pass the wrapper req
+        if not handleCORS(req, res) then return end
 
         if handler_info then
-            local handler = handler_info -- handler_info is already the function
+            local handler = handler_info
             local query_params = parseQuery(_req.url)
-            -- Call executeMiddleware as a method on 'self'
             if executeMiddleware(self_ref, req, res, path, self_ref.middlewares, 1) then
                 method = string.upper(method)
                 if method == "WS" then
-                    -- WebSocket upgrade logic should be handled by the ws route
                     res:writeStatus(404):send("Not Found")
                 elseif method == "GET" or method == "DELETE" or method == "HEAD" or method == "OPTIONS" then
                     local ok, err = pcall(function()
-                        handler(req, res, query_params) -- Pass the wrapper req
+                        handler(req, res, query_params)
                     end)
                     if not ok then
                         self_ref.logger:log(log_level.ERROR, string.format("Error in route handler for %s %s: %s", method, path, tostring(err)), "DawnServer")
@@ -387,25 +377,17 @@ function DawnServer:run()
                     end
                 elseif method == "POST" or method == "PUT" or method == "PATCH" then
                     local content_type = (_req:getHeader("content-type") or ""):lower()
-                    -- local content_type = (_req:getHeader("content-type") or ""):lower()
-                    -- print("check content type? : ", content_type)
                     local multipart_marker = "multipart/form-data"
-                    -- print("direct comparison (start): ", (content_type:sub(1, #multipart_marker) == multipart_marker))
-                    -- print("content type is multipart? ", content_type:match(multipart_marker))
-                    -- print("check content type? : ", content_type )
-                    
 
                     if (content_type:sub(1, #multipart_marker) == multipart_marker) then
-
                         req.form_data_parser = req.form_data_parser or StreamingMultipartParser.new(content_type, function(part)
                             req.form_data = req.form_data or {}
                             req.form_data[part.name] = part.is_file and part or part.body
-                        end, self_ref.multipart_parser_options) -- Use configured options
+                        end, self_ref.multipart_parser_options)
 
-                        req.form_data_parser:feed(chunk or "") -- Feed the current chunk
+                        req.form_data_parser:feed(chunk or "")
 
                         if is_last then
-                            -- All chunks have been processed, call the handler with the parsed form data
                             local ok, err = pcall(handler, req, res, req.form_data)
                             if not ok then
                                 self_ref.logger:log(log_level.ERROR, string.format("Error in multipart route handler for %s %s: %s", method, path, tostring(err)), "DawnServer")
@@ -420,7 +402,6 @@ function DawnServer:run()
                             end
                         end
                     else
-                        -- Handle other content types (like application/json or url-encoded) as before
                         if chunk then
                             req.body = (req.body or "") .. chunk
                         end
@@ -430,6 +411,10 @@ function DawnServer:run()
 
                             if content_type:find("application/json") then
                                 parsed_body = json.decode(req.body)
+                                if not parsed_body then
+                                    parse_error = "Failed to parse JSON body"
+                                    self_ref.logger:log(log_level.ERROR, string.format("Error parsing JSON body for %s %s: %s", method, path, parse_error), "DawnServer")
+                                end
                             elseif content_type:find("application/x-www-form-urlencoded") then
                                 parsed_body = {}
                                 for key, value in (req.body or ""):gmatch("([^&=]+)=([^&=]*)") do
@@ -458,31 +443,24 @@ function DawnServer:run()
                 end
             end
         else
+            -- If no specific Lua route handler is found, the C++ `serve_static` might still catch it.
+            -- If it's not caught by `serve_static`, then it's a true 404.
             res:writeStatus(404):send("Not Found")
         end
     end
 
-   local  function get_last_path_segment(path)
-        return path:match("([^/]+)/*$") or ""
-    end
-
-    -- Register handlers for each route based on the method
     local function registerRouteHandlers(node, prefix)
-    
         if node.handler then
             local method = node.handler.method:lower()
             local routePath = prefix
             if method == "ws" then
-
                 uws.ws(routePath, function(ws, event, message, code, reason)
                     if event == "open" then
-                         -- Create minimal fake req and res to run middleware
                         local fake_req = {
                             method = "WS",
                             url = routePath,
-                            headers = {} -- You can extend this if needed
+                            headers = {}
                         }
-
                         local fake_res = {}
                         fake_res.writeHeader = function() return fake_res end
                         fake_res.writeStatus = function() return fake_res end
@@ -490,32 +468,24 @@ function DawnServer:run()
                             print( "[WS Middleware] Blocking upgrade:", ..., " : dawn_server")
                             ws:close()
                         end
-                
                         local ok = executeMiddleware(self_ref, fake_req, fake_res, routePath, self_ref.middlewares, 1)
                         if ok then
-                            -- table.insert(self.shared_state.sessions, {uuid.v4() =  self.shared_state.sessions['ws_identifier'] or require('utils.uuid').v4()
                             self_ref.dawn_sockets_handler:handle_open( ws, message)
                         else
-                            -- Middleware rejected the connection; already handled in res.send()
                             print("[WS] Connection rejected by middleware:", routePath)
                         end
-                
                     elseif event == "message" then
                         self_ref.dawn_sockets_handler:handle_message( ws, message, code)
                     elseif event == "close" then
                         self_ref.dawn_sockets_handler:handle_close( ws, code, reason)
                     end
                 end)
-                
-                
             elseif method == "get" or method == "delete" or method == "head" or method == "options" then
-                uws[method](routePath, handleRequest) -- Now handleRequest will have access to 'self' indirectly
+                uws[method](routePath, handleRequest)
             elseif method == "post" or method == "put" or method == "patch" then
                 uws[method](routePath, handleRequest)
             end
         end
-        --  local slashCount = select(2, prefix:gsub("/", ""))
-
         for path, child in pairs(node.children) do
             local slashCount = select(2, prefix:gsub("/", ""))
             local param = child.params[slashCount + 1] or ""
@@ -525,9 +495,14 @@ function DawnServer:run()
             )
             registerRouteHandlers(child, nextPrefix)
         end
-
     end
     registerRouteHandlers(self.router, "")
+
+    -- Register static file serving using the new uws.serve_static function
+    for _, config in ipairs(self_ref.static_configs) do
+        self_ref.logger:log(log_level.INFO, string.format("Serving static files from '%s' at route '%s'", config.directory_path, config.route_prefix), "DawnServer")
+        uws.serve_static(config.route_prefix, config.directory_path) -- <--- Call the new C++ function here
+    end
 
     self:printRoutes()
     uws.listen(self.port, function(token)
@@ -548,13 +523,12 @@ function DawnServer:stop()
 end
 
 function DawnServer:start()
-
     local dawnProcessChild = {
         name = "DawnServer_Supervisor",
         start = function()
-            self.logger:log(log_level.INFO, "Dawn Server connection  started".. self.port, "DawnServer")
+            self.logger:log(log_level.INFO, "Dawn Server connection started".. self.port, "DawnServer")
             self:run()
-            local ok, err = pcall(uws.run) -- uws.run doesn't take arguments
+            local ok, err = pcall(uws.run)
             if not ok then
                 self.logger:log(log_level.ERROR, "Fatal server error: " .. tostring(err), "DawnServer")
             end
@@ -574,8 +548,6 @@ function DawnServer:start()
         restart_count = 5,
         backoff = 5000
     }
-    --  self.supervisor:addChild(dawnProcessChild)
     self.supervisor:startChild(dawnProcessChild)
-    uv.run()
 end
 return DawnServer

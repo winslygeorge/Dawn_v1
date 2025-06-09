@@ -26,15 +26,16 @@ sudo snap install redis
 luarocks install redis-lua
 
 compile command 
-
-#installing tarantool
-sudo curl -L https://tarantool.io/release/3/installer.sh | bash
-curl -L https://tarantool.io/release/3/installer.sh | bash
-
-
-sudo apt-get -y install tarantool
-sudo luarocks install lua-messagepack
-sudo luarocks install --server=https://luarocks.org/dev lua-resty-tarantool
-
 g++ -std=c++17 -o ./uwebsockets.so -shared -fPIC     -I/usr/local/include/luajit-2.1     -I/usr/local/include/uWebSockets     -I/usr/local/include/uSockets     -I/usr/include     uwebsockets_shim.cpp     -L/usr/local/lib     -lluajit-5.1 -luSockets -luv -lz     -Wl,-rpath,/usr/local/lib     -Wl,-E
 
+# run redis
+redis-server --daemonize yes
+# run redis-cli
+redis-cli
+
+# install postgres
+sudo apt update
+sudo apt install postgresql postgresql-contrib
+sudo -u postgres psql
+
+sudo apt install libpq-dev

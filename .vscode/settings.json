@@ -72,6 +72,7 @@
         "xlocnum": "c",
         "xloctime": "c",
         "xmemory": "c",
-        "xtr1common": "c"
+        "xtr1common": "c",
+        "filesystem": "cpp"
     }
 }

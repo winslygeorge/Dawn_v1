@@ -1,0 +1,15 @@
+<nav class="navbar">
+    <a href="/" class="navbar-brand">Dawnserver</a>
+    <ul>
+        {{#data.links}}
+            <li><a href="{{url}}">{{text}}</a></li>
+        {{/data.links}}
+        {{#data.user.loggedIn}}
+            <li>Hello, {{data.user.name}}</li>
+            <li><a href="/logout">Logout</a></li>
+        {{/data.user.loggedIn}}
+        {{^data.user.loggedIn}}
+            <li><a href="/login">Login</a></li>
+        {{/data.user.loggedIn}}
+    </ul>
+</nav>

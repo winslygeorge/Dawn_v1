@@ -1,16 +1,775 @@
-how to declare on_message handler in example.lua
+#include <uWebSockets/App.h>
+#include <lua.hpp>
+#include <iostream>
+#include <unordered_map>
+#include <memory>
+#include <mutex>
+#include <string_view>
+#include <vector>
+#include <functional>
+#include <string> // For std::to_string
+#include <sys/socket.h> // For sockaddr, sockaddr_storage
+#include <netdb.h>
+#include <random>       // Include for random number generation
+#include <sstream>      // Include for stringstream
+#include <iomanip>
 
-local function on_message(ws, msg, conn_state, shared)
-    conn_state.state.last_pong = os.time()
+// Include uSockets header for us_loop_t structure if needed
+// This might require knowing the internal structure of uSockets,
+// which can change between versions.
+// A more robust approach might be to compile uWS with a specific libuv and ensure luv uses the same.
+// For now, let's assume we can get the uv_loop_t* via Loop::get() or similar.
+#include <uv.h>
 
-    if msg.type == "ping" then
-        ws:send('{"type":"pong"}')
-    elseif msg.type == "join_game" then
-        local uid = msg.user_id or "guest_" .. tostring(ws)
-        conn_state.user_id = uid
-        shared.players[uid] = ws
-        ws:send('{"type":"join_ack","user_id":"' .. uid .. '"}')
-    else
-        ws:send('{"error":"Unknown message type"}')
-    end
-end
+static std::shared_ptr<uWS::App> app;
+static lua_State *main_L = nullptr;
+static std::mutex lua_mutex;
+static std::unordered_map<int, int> lua_callbacks;
+static int callback_id_counter = 0;
+
+// Store the uWS::Loop pointer if needed for explicit polling/deferring
+static uWS::Loop* uws_loop = nullptr;
+
+struct DummyUserData {};
+
+// Middleware structures
+struct Middleware {
+    int ref; // Lua function reference
+    bool global; // true for global, false for route-specific
+    std::string route; // Route for route-specific middleware
+};
+
+static std::vector<Middleware> middlewares;
+
+int uw_create_app(lua_State *L) {
+    if (!app) {
+        app = std::make_shared<uWS::App>();
+        main_L = L;
+        uws_loop = uWS::Loop::get(); // Get the uWS event loop instance
+    }
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+int create_req_userdata(lua_State *L, uWS::HttpRequest* req) {
+    void *ud = lua_newuserdata(L, sizeof(uWS::HttpRequest*));
+    uWS::HttpRequest** req_ptr = (uWS::HttpRequest**)ud;
+    *req_ptr = req;
+
+    luaL_getmetatable(L, "req");
+    lua_setmetatable(L, -2);
+
+    return 1;
+}
+
+int create_res_userdata(lua_State *L, uWS::HttpResponse<false>* res) {
+    void *ud = lua_newuserdata(L, sizeof(uWS::HttpResponse<false>*));
+    uWS::HttpResponse<false>** res_ptr = (uWS::HttpResponse<false>**)ud;
+    *res_ptr = res;
+
+    luaL_getmetatable(L, "res");
+    lua_setmetatable(L, -2);
+
+    return 1;
+}
+
+static int res_writeStatus(lua_State *L) {
+    uWS::HttpResponse<false>** res = (uWS::HttpResponse<false>**)luaL_checkudata(L, 1, "res");
+    int status = luaL_checkinteger(L, 2);
+    (*res)->writeStatus(std::to_string(status).c_str());
+    lua_pushvalue(L, 1); // Return self for chaining
+    return 1;
+}
+
+static int res_getRemoteAddress(lua_State *L) {
+    uWS::HttpResponse<false>** res = (uWS::HttpResponse<false>**)luaL_checkudata(L, 1, "res");
+    std::string_view remoteAddress = (*res)->getRemoteAddress();
+    lua_pushlstring(L, remoteAddress.data(), remoteAddress.length());
+    return 1;
+}
+
+static int res_getProxiedRemoteAddress(lua_State *L) {
+    uWS::HttpResponse<false>** res = (uWS::HttpResponse<false>**)luaL_checkudata(L, 1, "res");
+    return res_getRemoteAddress(L);
+}
+
+static int res_closeConnection(lua_State *L) {
+    uWS::HttpResponse<false>** res = (uWS::HttpResponse<false>**)luaL_checkudata(L, 1, "res");
+    (*res)->close();
+    return 0;
+}
+
+// User data structure for WebSocket
+struct WebSocketUserData {
+    std::string id;
+};
+
+static int websocket_send(lua_State *L) {
+    void *ud = luaL_checkudata(L, 1, "websocket");
+    if (!ud) {
+        luaL_error(L, "Invalid WebSocket object");
+        return 0;
+    }
+    uWS::WebSocket<false, true, WebSocketUserData>* ws = *(uWS::WebSocket<false, true, WebSocketUserData>**)ud;
+    const char *message = luaL_checkstring(L, 2);
+    size_t len = lua_objlen(L, 2);
+    uWS::OpCode opCodeToSend = uWS::OpCode::TEXT; // Default to text
+
+    if (lua_gettop(L) > 2 && lua_isstring(L, 3)) {
+        const char *type = luaL_checkstring(L, 3);
+        if (strcmp(type, "binary") == 0) {
+            opCodeToSend = uWS::OpCode::BINARY;
+        }
+    }
+
+    if (ws) {
+        // Use defer to send from the uWS event loop thread if this function is called from a different thread
+        // (e.g., if Lua has its own threads or is called from a different libuv watcher).
+        // For simplicity and assuming main_L operations are always serialized via lua_mutex,
+        // we'll assume this is safe for now, but in complex multi-threading, defer is crucial.
+        ws->send(std::string_view(message, len), opCodeToSend);
+        lua_pushboolean(L, 1);
+        return 1;
+    } else {
+        luaL_error(L, "Invalid WebSocket object");
+        return 0;
+    }
+}
+
+static int websocket_close(lua_State *L) {
+    void *ud = luaL_checkudata(L, 1, "websocket");
+    if (!ud) {
+        luaL_error(L, "Invalid WebSocket object");
+        return 0;
+    }
+    uWS::WebSocket<false, true, DummyUserData>* ws = *(uWS::WebSocket<false, true, DummyUserData>**)ud;
+    if (ws) {
+        ws->close(); // Call close with no arguments
+        lua_pushboolean(L, 1);
+        return 1;
+    } else {
+        luaL_error(L, "Invalid WebSocket object");
+        return 0;
+    }
+}
+
+static void create_websocket_metatable(lua_State *L) {
+    luaL_newmetatable(L, "websocket");
+    lua_pushstring(L, "__index");
+    lua_newtable(L); // Metatable for methods
+    lua_pushcfunction(L, websocket_send);
+    lua_setfield(L, -2, "send");
+    lua_pushcfunction(L, websocket_close);
+    lua_setfield(L, -2, "close");
+    lua_settable(L, -3); // Set __index to the methods table
+    lua_pop(L, 1); // Pop the metatable
+}
+
+static void create_metatables(lua_State *L) {
+    create_websocket_metatable(L);
+    luaL_newmetatable(L, "req");
+    lua_pushstring(L, "__index");
+    lua_pushcfunction(L, [](lua_State *L) -> int {
+        uWS::HttpRequest** req = (uWS::HttpRequest**)luaL_checkudata(L, 1, "req");
+        const char *key = luaL_checkstring(L, 2);
+        if (strcmp(key, "method") == 0) {
+            lua_pushstring(L, (*req)->getMethod().data());
+            return 1;
+        } else if (strcmp(key, "url") == 0) {
+            lua_pushstring(L, (*req)->getUrl().data());
+            return 1;
+        } else if (strcmp(key, "query") == 0) {
+            lua_pushstring(L, (*req)->getQuery().data());
+            return 1;
+        } else if (strcmp(key, "getHeader") == 0) {
+            lua_pushcclosure(L, [](lua_State *L) -> int {
+                uWS::HttpRequest** req = (uWS::HttpRequest**)luaL_checkudata(L, 1, "req");
+                const char *header_name = luaL_checkstring(L, 2);
+                std::string_view header_value = (*req)->getHeader(header_name);
+                lua_pushlstring(L, header_value.data(), header_value.length());
+                return 1;
+            }, 0);
+            return 1;
+        }
+        else if (strcmp(key, "getUrl") == 0) {
+            lua_pushcfunction(L, [](lua_State *L) -> int {
+                uWS::HttpRequest** req = (uWS::HttpRequest**)luaL_checkudata(L, 1, "req");
+                std::string_view url = (*req)->getUrl();
+                lua_pushlstring(L, url.data(), url.length());
+                return 1;
+            });
+            return 1;
+        }
+
+        lua_pushnil(L);
+        return 1;
+    });
+    lua_settable(L, -3);
+    lua_pop(L, 1);
+
+    luaL_newmetatable(L, "res");
+    lua_pushstring(L, "__index");
+    lua_pushcfunction(L, [](lua_State *L) -> int {
+        uWS::HttpResponse<false>** res = (uWS::HttpResponse<false>**)luaL_checkudata(L, 1, "res");
+        const char *key = luaL_checkstring(L, 2);
+        if (strcmp(key, "send") == 0) {
+            lua_pushcclosure(L, [](lua_State *L) -> int {
+                uWS::HttpResponse<false>** res = (uWS::HttpResponse<false>**)luaL_checkudata(L, 1, "res");
+                const char *response = luaL_checkstring(L, 2);
+                // Defer 'end' to the uWS loop thread if necessary
+                if (uws_loop && uws_loop != uWS::Loop::get()) { // Check if we are on a different thread
+                    uws_loop->defer([res_copy = *res, response_copy = std::string(response)]() {
+                        res_copy->end(response_copy);
+                    });
+                } else {
+                    (*res)->end(response);
+                }
+                return 0;
+            }, 0);
+            return 1;
+        } else if (strcmp(key, "writeHeader") == 0) {
+            lua_pushcclosure(L, [](lua_State *L) -> int {
+                uWS::HttpResponse<false>** res = (uWS::HttpResponse<false>**)luaL_checkudata(L, 1, "res");
+                const char *header = luaL_checkstring(L, 2);
+                const char *value = luaL_checkstring(L, 3);
+                // Defer 'writeHeader' if necessary
+                if (uws_loop && uws_loop != uWS::Loop::get()) {
+                     uws_loop->defer([res_copy = *res, header_copy = std::string(header), value_copy = std::string(value)]() {
+                        res_copy->writeHeader(header_copy, value_copy);
+                    });
+                } else {
+                    (*res)->writeHeader(header, value);
+                }
+                lua_pushvalue(L, 1);
+                return 1;
+            }, 0);
+            return 1;
+        } else if (strcmp(key, "writeStatus") == 0) {
+            lua_pushcfunction(L, res_writeStatus);
+            return 1;
+        } else if (strcmp(key, "getRemoteAddress") == 0) {
+            lua_pushcfunction(L, res_getRemoteAddress);
+            return 1;
+        } else if (strcmp(key, "getProxiedRemoteAddress") == 0) {
+            lua_pushcfunction(L, res_getProxiedRemoteAddress);
+            return 1;
+        } else if (strcmp(key, "closeConnection") == 0) {
+            lua_pushcfunction(L, res_closeConnection);
+            return 1;
+        }
+        lua_pushnil(L);
+        return 1;
+    });
+    lua_settable(L, -3);
+    lua_pop(L, 1);
+}
+
+// Function to execute middleware
+bool execute_middleware(lua_State *L, uWS::HttpResponse<false> *res, uWS::HttpRequest *req, const std::string& route) {
+    for (const auto& mw : middlewares) {
+        if (mw.global || mw.route == route) {
+            lua_rawgeti(L, LUA_REGISTRYINDEX, mw.ref);
+            create_req_userdata(L, req);
+            create_res_userdata(L, res);
+            if (lua_pcall(L, 2, 1, 0) != LUA_OK) {
+                std::cerr << "Lua middleware error: " << lua_tostring(L, -1) << std::endl;
+                lua_pop(L, 1);
+                return false; // Middleware error, stop processing
+            }
+
+            if (lua_isboolean(L, -1) && !lua_toboolean(L, -1)) {
+                lua_pop(L, 1); // Remove boolean return
+                return false; // Middleware returned false, stop processing
+            }
+            lua_pop(L, 1); // Remove boolean return
+        }
+    }
+    return true; // Continue processing if no middleware returned false
+}
+
+// Function to add middleware
+int uw_use(lua_State *L) {
+    luaL_checktype(L, 1, LUA_TFUNCTION);
+    lua_pushvalue(L, 1);
+    int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+
+    Middleware mw;
+    mw.ref = ref;
+    mw.global = true;
+
+    if (lua_gettop(L) > 1 && lua_isstring(L, 2)) {
+        mw.global = false;
+        mw.route = luaL_checkstring(L, 2);
+    }
+    middlewares.push_back(mw);
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+int uw_get(lua_State *L) {
+    const char *route = luaL_checkstring(L, 1);
+    luaL_checktype(L, 2, LUA_TFUNCTION);
+    lua_pushvalue(L, 2);
+    int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    int callback_id = callback_id_counter++;
+    lua_callbacks[callback_id] = ref;
+
+    app->get(route, [callback_id, route](auto *res, auto *req) {
+        std::lock_guard<std::mutex> lock(lua_mutex);
+        if (!execute_middleware(main_L, res, req, route)) return;
+
+        lua_rawgeti(main_L, LUA_REGISTRYINDEX, lua_callbacks[callback_id]);
+        create_req_userdata(main_L, req);
+        create_res_userdata(main_L, res);
+
+        if (lua_pcall(main_L, 2, 0, 0) != LUA_OK) {
+            std::cerr << "Lua error: " << lua_tostring(main_L, -1) << std::endl;
+            lua_pop(main_L, 1);
+            // This is crucial: Ensure res operations are deferred to the uWS loop thread
+            if (uws_loop) {
+                uws_loop->defer([res_copy = res]() {
+                    res_copy->writeHeader("Content-Type", "text/plain")->end("Internal Server Error");
+                });
+            } else {
+                res->writeHeader("Content-Type", "text/plain")->end("Internal Server Error");
+            }
+        }
+    });
+
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+int uw_post(lua_State *L) {
+    const char *route = luaL_checkstring(L, 1);
+    luaL_checktype(L, 2, LUA_TFUNCTION);
+    lua_pushvalue(L, 2);
+    int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    int callback_id = callback_id_counter++;
+    lua_callbacks[callback_id] = ref;
+
+    app->post(route, [callback_id, route](uWS::HttpResponse<false> *res_uws, uWS::HttpRequest *req_uws) {
+        // std::cerr << "uw_post handler called. res_uws: " << res_uws << ", req_uws: " << req_uws << std::endl;
+        if(res_uws){
+            res_uws->onData([callback_id, res_uws, req_uws, route](std::string_view data, bool last) mutable {
+                std::lock_guard<std::mutex> lock(lua_mutex);
+                if (!execute_middleware(main_L, res_uws, req_uws, route)) return;
+
+                lua_rawgeti(main_L, LUA_REGISTRYINDEX, lua_callbacks[callback_id]);
+                create_req_userdata(main_L, req_uws);
+                create_res_userdata(main_L, res_uws);
+                lua_pushlstring(main_L, data.data(), data.size());
+                lua_pushboolean(main_L, last);
+
+                if (lua_pcall(main_L, 4, 0, 0) != LUA_OK) {
+                    std::cerr << "Lua error in POST handler: " << lua_tostring(main_L, -1) << std::endl;
+                    lua_pop(main_L, 1);
+                    if (uws_loop) {
+                        uws_loop->defer([res_copy = res_uws]() {
+                            res_copy->writeHeader("Content-Type", "text/plain")->end("Internal Server Error");
+                        });
+                    } else {
+                        res_uws->writeHeader("Content-Type", "text/plain")->end("Internal Server Error");
+                    }
+                }
+            });
+
+            res_uws->onAborted([]() {
+                std::cerr << "POST request aborted" << std::endl;
+            });
+
+        }else{
+            std::cerr << "Error: res_uws is NULL in POST handler!" << std::endl;
+        }
+    });
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+int uw_put(lua_State *L) {
+    const char *route = luaL_checkstring(L, 1);
+    luaL_checktype(L, 2, LUA_TFUNCTION);
+    lua_pushvalue(L, 2);
+    int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    int callback_id = callback_id_counter++;
+    lua_callbacks[callback_id] = ref;
+
+    app->put(route, [callback_id, route](uWS::HttpResponse<false> *res_uws, uWS::HttpRequest *req_uws) {
+        std::string body;
+        res_uws->onData([callback_id, res_uws, &body, req_uws, route](std::string_view data, bool last) mutable {
+            body.append(data.data(), data.size());
+            if (last) {
+                std::lock_guard<std::mutex> lock(lua_mutex);
+                if (!execute_middleware(main_L, res_uws, req_uws, route)) return;
+
+                lua_rawgeti(main_L, LUA_REGISTRYINDEX, lua_callbacks[callback_id]);
+                create_req_userdata(main_L, req_uws);
+                create_res_userdata(main_L, res_uws);
+                lua_pushlstring(main_L, body.data(), body.size());
+
+                if (lua_pcall(main_L, 3, 0, 0) != LUA_OK) {
+                    std::cerr << "Lua error in PUT handler: " << lua_tostring(main_L, -1) << std::endl;
+                    lua_pop(main_L, 1);
+                    if (uws_loop) {
+                        uws_loop->defer([res_copy = res_uws]() {
+                            res_copy->writeHeader("Content-Type", "text/plain")->end("Internal Server Error");
+                        });
+                    } else {
+                        res_uws->writeHeader("Content-Type", "text/plain")->end("Internal Server Error");
+                    }
+                }
+            }
+        });
+        res_uws->onAborted([]() {
+            std::cerr << "PUT request aborted" << std::endl;
+        });
+    });
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+int uw_delete(lua_State *L) {
+    const char *route = luaL_checkstring(L, 1);
+    luaL_checktype(L, 2, LUA_TFUNCTION);
+    lua_pushvalue(L, 2);
+    int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    int callback_id = callback_id_counter++;
+    lua_callbacks[callback_id] = ref;
+
+    app->del(route, [callback_id, route](uWS::HttpResponse<false> *res_uws, uWS::HttpRequest *req_uws) {
+        std::lock_guard<std::mutex> lock(lua_mutex);
+        if (!execute_middleware(main_L, res_uws, req_uws, route)) return;
+
+        lua_rawgeti(main_L, LUA_REGISTRYINDEX, lua_callbacks[callback_id]);
+        create_req_userdata(main_L, req_uws);
+        create_res_userdata(main_L, res_uws);
+
+        if (lua_pcall(main_L, 2, 0, 0) != LUA_OK) {
+            std::cerr << "Lua error in DELETE handler: " << lua_tostring(main_L, -1) << std::endl;
+            lua_pop(main_L, 1);
+            if (uws_loop) {
+                uws_loop->defer([res_copy = res_uws]() {
+                    res_copy->writeHeader("Content-Type", "text/plain")->end("Internal Server Error");
+                });
+            } else {
+                res_uws->writeHeader("Content-Type", "text/plain")->end("Internal Server Error");
+            }
+        }
+    });
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+int uw_patch(lua_State *L) {
+    const char *route = luaL_checkstring(L, 1);
+    luaL_checktype(L, 2, LUA_TFUNCTION);
+    lua_pushvalue(L, 2);
+    int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    int callback_id = callback_id_counter++;
+    lua_callbacks[callback_id] = ref;
+
+    app->patch(route, [callback_id, route](uWS::HttpResponse<false> *res_uws, uWS::HttpRequest *req_uws) {
+        std::string body;
+        res_uws->onData([callback_id, res_uws, &body, req_uws, route](std::string_view data, bool last) mutable {
+            body.append(data.data(), data.size());
+            if (last) {
+                std::lock_guard<std::mutex> lock(lua_mutex);
+                if (!execute_middleware(main_L, res_uws, req_uws, route)) return;
+
+                lua_rawgeti(main_L, LUA_REGISTRYINDEX, lua_callbacks[callback_id]);
+                create_req_userdata(main_L, req_uws);
+                create_res_userdata(main_L, res_uws);
+                lua_pushlstring(main_L, body.data(), body.size());
+
+                if (lua_pcall(main_L, 3, 0, 0) != LUA_OK) {
+                    std::cerr << "Lua error in PATCH handler: " << lua_tostring(main_L, -1) << std::endl;
+                    lua_pop(main_L, 1);
+                    if (uws_loop) {
+                        uws_loop->defer([res_copy = res_uws]() {
+                            res_copy->writeHeader("Content-Type", "text/plain")->end("Internal Server Error");
+                        });
+                    } else {
+                        res_uws->writeHeader("Content-Type", "text/plain")->end("Internal Server Error");
+                    }
+                }
+            }
+        });
+        res_uws->onAborted([]() {
+            std::cerr << "PATCH request aborted" << std::endl;
+        });
+    });
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+int uw_head(lua_State *L) {
+    const char *route = luaL_checkstring(L, 1);
+    luaL_checktype(L, 2, LUA_TFUNCTION);
+    lua_pushvalue(L, 2);
+    int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    int callback_id = callback_id_counter++;
+    lua_callbacks[callback_id] = ref;
+
+    app->head(route, [callback_id, route](uWS::HttpResponse<false> *res_uws, uWS::HttpRequest *req_uws) {
+        std::lock_guard<std::mutex> lock(lua_mutex);
+        if (!execute_middleware(main_L, res_uws, req_uws, route)) return;
+
+        lua_rawgeti(main_L, LUA_REGISTRYINDEX, lua_callbacks[callback_id]);
+        create_req_userdata(main_L, req_uws);
+        create_res_userdata(main_L, res_uws);
+
+        if (lua_pcall(main_L, 2, 0, 0) != LUA_OK) {
+            std::cerr << "Lua error in HEAD handler: " << lua_tostring(main_L, -1) << std::endl;
+            lua_pop(main_L, 1);
+            if (uws_loop) {
+                uws_loop->defer([res_copy = res_uws]() {
+                    res_copy->writeHeader("Content-Type", "text/plain")->end("Internal Server Error");
+                });
+            } else {
+                res_uws->writeHeader("Content-Type", "text/plain")->end("Internal Server Error");
+            }
+        }
+    });
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+int uw_options(lua_State *L) {
+    const char *route = luaL_checkstring(L, 1);
+    luaL_checktype(L, 2, LUA_TFUNCTION);
+    lua_pushvalue(L, 2);
+    int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    int callback_id = callback_id_counter++;
+    lua_callbacks[callback_id] = ref;
+
+    app->options(route, [callback_id, route](uWS::HttpResponse<false> *res_uws, uWS::HttpRequest *req_uws) {
+        std::lock_guard<std::mutex> lock(lua_mutex);
+        if (!execute_middleware(main_L, res_uws, req_uws, route)) return;
+
+        lua_rawgeti(main_L, LUA_REGISTRYINDEX, lua_callbacks[callback_id]);
+        create_req_userdata(main_L, req_uws);
+        create_res_userdata(main_L, res_uws);
+
+        if (lua_pcall(main_L, 2, 0, 0) != LUA_OK) {
+            std::cerr << "Lua error in OPTIONS handler: " << lua_tostring(main_L, -1) << std::endl;
+            lua_pop(main_L, 1);
+            if (uws_loop) {
+                uws_loop->defer([res_copy = res_uws]() {
+                    res_copy->writeHeader("Content-Type", "text/plain")->end("Internal Server Error");
+                });
+            } else {
+                res_uws->writeHeader("Content-Type", "text/plain")->end("Internal Server Error");
+            }
+        }
+    });
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+// Function to generate a simple unique ID
+std::string generate_unique_id() {
+    static std::random_device rd;
+    static std::mt19937 gen(rd());
+    static std::uniform_int_distribution<> distrib(0, 15);
+
+    std::stringstream ss;
+    for (int i = 0; i < 16; ++i) {
+        int val = distrib(gen);
+        ss << std::hex << val;
+        if (i == 3 || i == 5 || i == 7 || i == 9) {
+            ss << "-";
+        }
+    }
+    return ss.str();
+}
+
+// Lua function to get the WebSocket ID
+static int websocket_get_id(lua_State *L) {
+    uWS::WebSocket<false, true, WebSocketUserData>** ws_ud = static_cast<uWS::WebSocket<false, true, WebSocketUserData>**>(luaL_checkudata(L, 1, "websocket"));
+    if (!ws_ud || !*ws_ud) {
+        luaL_error(L, "invalid websocket userdata");
+        return 0;
+    }
+
+    lua_pushstring(L, (*ws_ud)->getUserData()->id.c_str());
+    return 1;
+}
+
+int uw_ws(lua_State *L) {
+    const char *route = luaL_checkstring(L, 1);
+    luaL_checktype(L, 2, LUA_TFUNCTION);
+    lua_pushvalue(L, 2);
+    int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    int callback_id = callback_id_counter++;
+    lua_callbacks[callback_id] = ref;
+
+    app->ws<WebSocketUserData>(route, {
+        .open = [callback_id, route](auto *ws) {
+            std::lock_guard<std::mutex> lock(lua_mutex);
+            lua_rawgeti(main_L, LUA_REGISTRYINDEX, lua_callbacks[callback_id]);
+
+            // Push the WebSocket userdata and set its metatable
+            uWS::WebSocket<false, true, WebSocketUserData>** ws_ud = static_cast<uWS::WebSocket<false, true, WebSocketUserData>**>(lua_newuserdata(main_L, sizeof(uWS::WebSocket<false, true, WebSocketUserData>*)));
+            *ws_ud = ws;
+            luaL_getmetatable(main_L, "websocket");
+            lua_setmetatable(main_L, -2);
+
+            // Generate and store the unique ID in the user data
+            ws->getUserData()->id = generate_unique_id();
+
+            lua_pushstring(main_L, "open");
+
+            if (lua_pcall(main_L, 2, 0, 0) != LUA_OK) {
+                std::cerr << "Lua error (open): " << lua_tostring(main_L, -1) << std::endl;
+                lua_pop(main_L, 1);
+            }
+        },
+
+        .message = [callback_id](auto *ws, std::string_view message, uWS::OpCode opCode) {
+            std::cout << "uWS opcode enum value: " << static_cast<int>(opCode) << std::endl;
+            std::lock_guard<std::mutex> lock(lua_mutex);
+            lua_rawgeti(main_L, LUA_REGISTRYINDEX, lua_callbacks[callback_id]);
+
+            // Push the WebSocket userdata with metatable
+            uWS::WebSocket<false, true, WebSocketUserData>** ws_ud = static_cast<uWS::WebSocket<false, true, WebSocketUserData>**>(lua_newuserdata(main_L, sizeof(uWS::WebSocket<false, true, WebSocketUserData>*)));
+            *ws_ud = ws;
+            luaL_getmetatable(main_L, "websocket");
+            lua_setmetatable(main_L, -2);
+
+            lua_pushstring(main_L, "message");
+            lua_pushlstring(main_L, message.data(), message.size());
+            lua_pushinteger(main_L, static_cast<int>(opCode));
+
+
+            if (lua_pcall(main_L, 4, 0, 0) != LUA_OK) {
+                std::cerr << "Lua error (message): " << lua_tostring(main_L, -1) << std::endl;
+                lua_pop(main_L, 1);
+            }
+        },
+
+        .close = [callback_id](auto *ws, int code, std::string_view message) {
+            std::lock_guard<std::mutex> lock(lua_mutex);
+            lua_rawgeti(main_L, LUA_REGISTRYINDEX, lua_callbacks[callback_id]);
+
+            // Push the WebSocket userdata with metatable
+            uWS::WebSocket<false, true, WebSocketUserData>** ws_ud = static_cast<uWS::WebSocket<false, true, WebSocketUserData>**>(lua_newuserdata(main_L, sizeof(uWS::WebSocket<false, true, WebSocketUserData>*)));
+            *ws_ud = ws;
+            luaL_getmetatable(main_L, "websocket");
+            lua_setmetatable(main_L, -2);
+
+            lua_pushstring(main_L, "close");
+            lua_pushinteger(main_L, code);
+            lua_pushlstring(main_L, message.data(), message.size());
+
+            if (lua_pcall(main_L, 4, 0, 0) != LUA_OK) {
+                std::cerr << "Lua error (close): " << lua_tostring(main_L, -1) << std::endl;
+                lua_pop(main_L, 1);
+            }
+        }
+    });
+
+    // Register the get_id function in the "websocket" metatable
+    luaL_getmetatable(L, "websocket");
+    lua_pushcfunction(L, websocket_get_id);
+    lua_setfield(L, -2, "get_id");
+    lua_pop(L, 1); // Pop the metatable
+
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+int uw_listen(lua_State *L) {
+    if (!app) {
+        std::cerr << "Error: uWS::App not initialized." << std::endl;
+        lua_pushboolean(L, 0);
+        return 1;
+    }
+
+    int port = luaL_checkinteger(L, 1);
+    app->listen(port, [L, port](auto *token) {
+        // This callback happens in the uWS event loop thread.
+        // If you need to notify Lua, use a defer or an async handle.
+        std::lock_guard<std::mutex> lock(lua_mutex); // Lock for Lua state access
+        if (token) {
+            std::cout << "Listening on port " << port << std::endl;
+            // You could potentially push a success status to Lua here
+            // via a callback mechanism if Lua needs immediate notification.
+        } else {
+            std::cerr << "Failed to listen on port " << port << std::endl;
+            // Similarly, push an error status.
+        }
+    });
+
+    lua_pushboolean(L, 1); // Indicate that listen was called (success/failure of actual listen is async)
+    return 1;
+}
+
+// New function to expose the libuv loop pointer to Lua
+// This is the crucial part for `luv` integration.
+// Note: The specific structure for extracting uv_loop_t from uWS::Loop
+// might vary with uWebSockets versions. The most reliable way is often
+// to ensure uWS is compiled with LIBUV, and then access `us_loop_t` internal.
+// uWS::Loop::get() returns a us_loop_t*, which has a uv_loop_t* member.
+// You might need to adjust the offset or direct member access based on
+// uSockets' header (libusockets/src/internal/eventing/libuv.h).
+// A common pattern is:
+// struct us_loop_t {
+//   // ... other members
+//   uv_loop_t* uv_loop;
+//   // ... other members
+// };
+
+
+// ... (rest of your code) ...
+
+int uw_get_uv_loop(lua_State *L) {
+    if (!uws_loop) {
+        luaL_error(L, "uWS::App not initialized. Call create_app first.");
+        return 0;
+    }
+
+    // This is the crucial part that directly accesses the uv_loop_t*.
+    // It relies on the internal implementation detail that uv_loop_t*
+    // is the very first member of struct us_loop_t when compiled with LIBUS_USE_LIBUV.
+    uv_loop_t* uv_loop_ptr = (uv_loop_t*) uws_loop;
+
+    if (!uv_loop_ptr) {
+        luaL_error(L, "Could not retrieve libuv loop. The underlying uv_loop_t* was NULL.");
+        return 0;
+    }
+
+    lua_pushlightuserdata(L, uv_loop_ptr);
+    return 1;
+}
+
+// uw_run is no longer needed in its original blocking form
+// but we'll keep it as a no-op or provide a warning.
+int uw_run(lua_State *L) {
+    std::cerr << "Warning: uw_run is deprecated when integrating with luv. The uWS event loop is now managed by luv." << std::endl;
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+extern "C" int luaopen_uwebsockets(lua_State *L) {
+    create_metatables(L);
+
+    luaL_Reg functions[] = {
+        {"create_app", uw_create_app},
+        {"get", uw_get},
+        {"post", uw_post},
+        {"put", uw_put},
+        {"delete", uw_delete},
+        {"patch", uw_patch},
+        {"head", uw_head},
+        {"options", uw_options},
+        {"ws", uw_ws},
+        {"listen", uw_listen},
+        {"run", uw_run}, // Kept for backward compatibility, but now a no-op/warning
+        {"use", uw_use},
+        {"get_uv_loop", uw_get_uv_loop}, // New function to expose libuv loop
+        {nullptr, nullptr}
+    };
+
+    luaL_newlib(L, functions);
+    return 1;
+}

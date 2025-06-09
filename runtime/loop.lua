@@ -63,7 +63,7 @@ function Supervisor:addChild(child)
     assert(type(child.stop) == "function", "Child " .. child.name .. " must implement a stop() method")
 
     self.children[child.name] = child
-    self.runningChildren[child.name] = true
+    -- self.runningChildren[child.name] = true
 end
 
 

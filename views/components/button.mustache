@@ -1,0 +1,13 @@
+<button 
+  class="{{class}}" 
+  style="{{style}}" 
+  type="{{type}}" 
+  {{#action}}data-action="{{action}}"{{/action}} 
+  {{#disabled}}disabled{{/disabled}}>
+
+  {{#children.icon}}
+    <span class="icon">{{{children.icon}}}</span>
+  {{/children.icon}}
+
+  <span class="label">{{{children.label}}}</span>
+</button>

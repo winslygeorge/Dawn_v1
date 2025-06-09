@@ -499,81 +499,6 @@ int uw_options(lua_State *L) {
     return 1;
 }
 
-// int uw_ws(lua_State *L) {
-//     const char *route = luaL_checkstring(L, 1);
-//     luaL_checktype(L, 2, LUA_TFUNCTION);
-//     lua_pushvalue(L, 2);
-//     int ref = luaL_ref(L, LUA_REGISTRYINDEX);
-//     int callback_id = callback_id_counter++;
-//     lua_callbacks[callback_id] = ref;
-
-//     app->ws<DummyUserData>(route, {
-//         .open = [callback_id, route](auto *ws) {
-//             std::lock_guard<std::mutex> lock(lua_mutex);
-//             lua_rawgeti(main_L, LUA_REGISTRYINDEX, lua_callbacks[callback_id]);
-
-//             // Push the WebSocket userdata and set its metatable
-//             uWS::WebSocket<false, true, DummyUserData>** ws_ud = static_cast<uWS::WebSocket<false, true, DummyUserData>**>(lua_newuserdata(main_L, sizeof(uWS::WebSocket<false, true, DummyUserData>*)));
-//             *ws_ud = ws;
-//             luaL_getmetatable(main_L, "websocket");
-//             lua_setmetatable(main_L, -2);
-
-//             lua_pushstring(main_L, "open");
-
-//             if (lua_pcall(main_L, 2, 0, 0) != LUA_OK) {
-//                 std::cerr << "Lua error (open): " << lua_tostring(main_L, -1) << std::endl;
-//                 lua_pop(main_L, 1);
-//             }
-//         },
-
-//         .message = [callback_id](auto *ws, std::string_view message, uWS::OpCode opCode) {
-//             std::lock_guard<std::mutex> lock(lua_mutex);
-//             lua_rawgeti(main_L, LUA_REGISTRYINDEX, lua_callbacks[callback_id]);
-
-//             // Push the WebSocket userdata with metatable
-//             uWS::WebSocket<false, true, DummyUserData>** ws_ud = static_cast<uWS::WebSocket<false, true, DummyUserData>**>(lua_newuserdata(main_L, sizeof(uWS::WebSocket<false, true, DummyUserData>*)));
-//             *ws_ud = ws;
-//             luaL_getmetatable(main_L, "websocket");
-//             lua_setmetatable(main_L, -2);
-
-//             lua_pushstring(main_L, "message");
-//             lua_pushlstring(main_L, message.data(), message.size());
-
-//             if (lua_pcall(main_L, 3, 0, 0) != LUA_OK) {
-//                 std::cerr << "Lua error (message): " << lua_tostring(main_L, -1) << std::endl;
-//                 lua_pop(main_L, 1);
-//             }
-//         },
-
-//         .close = [callback_id](auto *ws, int code, std::string_view message) {
-//             std::lock_guard<std::mutex> lock(lua_mutex);
-//             lua_rawgeti(main_L, LUA_REGISTRYINDEX, lua_callbacks[callback_id]);
-
-//             // Push the WebSocket userdata with metatable
-//             uWS::WebSocket<false, true, DummyUserData>** ws_ud = static_cast<uWS::WebSocket<false, true, DummyUserData>**>(lua_newuserdata(main_L, sizeof(uWS::WebSocket<false, true, DummyUserData>*)));
-//             *ws_ud = ws;
-//             luaL_getmetatable(main_L, "websocket");
-//             lua_setmetatable(main_L, -2);
-
-//             lua_pushstring(main_L, "close");
-//             lua_pushinteger(main_L, code);
-//             lua_pushlstring(main_L, message.data(), message.size());
-
-//             if (lua_pcall(main_L, 4, 0, 0) != LUA_OK) {
-//                 std::cerr << "Lua error (close): " << lua_tostring(main_L, -1) << std::endl;
-//                 lua_pop(main_L, 1);
-//             }
-//         }
-//     });
-
-//     lua_pushboolean(L, 1);
-//     return 1;
-// }
-
-// Forward declaration (assuming these are defined elsewhere)
-
-
-
 // Function to generate a simple unique ID
 std::string generate_unique_id() {
     static std::random_device rd;
@@ -634,6 +559,7 @@ int uw_ws(lua_State *L) {
         },
 
         .message = [callback_id](auto *ws, std::string_view message, uWS::OpCode opCode) {
+            std::cout << "uWS opcode enum value: " << static_cast<int>(opCode) << std::endl;
             std::lock_guard<std::mutex> lock(lua_mutex);
             lua_rawgeti(main_L, LUA_REGISTRYINDEX, lua_callbacks[callback_id]);
 
@@ -645,11 +571,13 @@ int uw_ws(lua_State *L) {
 
             lua_pushstring(main_L, "message");
             lua_pushlstring(main_L, message.data(), message.size());
+            lua_pushinteger(main_L, static_cast<int>(opCode));
 
-            if (lua_pcall(main_L, 3, 0, 0) != LUA_OK) {
+
+            if (lua_pcall(main_L, 4, 0, 0) != LUA_OK) {
                 std::cerr << "Lua error (message): " << lua_tostring(main_L, -1) << std::endl;
                 lua_pop(main_L, 1);
-            }
+            }            
         },
 
         .close = [callback_id](auto *ws, int code, std::string_view message) {
