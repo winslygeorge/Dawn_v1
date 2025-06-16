@@ -1,9 +1,8 @@
 -- dawn_server.lua
 
-package.cpath = package.cpath .. ";./?.so"
 local uws = require("uwebsockets")
 local Supervisor = require("runtime.loop")
-local json = require('cjson')
+local json = require('dkjson')
 local StreamingMultipartParser = require('multipart_parser')
 local uv = require("luv")
 local URLParamExtractor = require("utils.query_extractor")
@@ -144,7 +143,7 @@ function DawnServer:new(config)
     -- New member to store static file configurations
     self.static_configs = config.static_configs or {} -- <--- Add this line
 
-    local DawnSockets = require("server.dawn_sockets")
+    local DawnSockets = require("dawn_sockets")
     self.dawn_sockets_handler = DawnSockets:new(self.supervisor, self.shared_state, self.config.state_management_options or {})
     if self.token_store.store then
         self.logger:log(log_level.INFO, "SETTING UP LOGGER", 'dawn_server', 345)

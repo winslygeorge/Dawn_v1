@@ -3,9 +3,11 @@ Hello first dawn project
 
 requirement
 
-cjson
+dkjson
 net-url
 luajwt
+lustache
+zlib
 
 sudo apt-get update
 sudo apt-get install libssl-dev
@@ -36,6 +38,70 @@ redis-cli
 # install postgres
 sudo apt update
 sudo apt install postgresql postgresql-contrib
+sudo apt install libpq-dev
+sudo service postgresql start
 sudo -u postgres psql
 
-sudo apt install libpq-dev
+
+# working uwebsockets installation command prompt
+
+sudo apt update
+sudo apt install git cmake python3 g++ libssl-dev zlib1g-dev lua5.1 luajit libluajit-5.1-dev
+
+
+🌄 Dawn Framework Overview
+Dawn is a modular, async-capable Lua web framework inspired by the architectural philosophy of Phoenix (Elixir) and Express (Node.js). It supports:
+
+RESTful HTTP routing
+
+Middleware pipelines
+
+JWT-based authentication
+
+WebSockets with presence, pub/sub, and modular event hooks
+
+Real-time components
+
+Server-side rendering with Lustache
+
+Lua bytecode + C++ compilation for performance
+
+🔧 Key Features
+✅ 1. Router & Controller Layer
+Controller.lua defines extendable controller logic
+
+Clean GET, POST, PUT, DELETE route handling
+
+Support for before/after hooks, middleware chains
+
+Validation, request/response abstraction
+
+RBAC-friendly authorize() hook
+
+✅ 2. Rendering Engine
+lustache_renderer.lua for server-side rendering
+
+Inspired by Phoenix’s eex — supports dynamic layouts and components
+
+FuncComponent.lua for functional UI fragments
+
+✅ 3. Runtime & Scheduling
+loop.lua and scheduler.lua: coroutine-safe event loops and background task runners
+
+Use for delayed jobs, token cleaning, async I/O
+
+✅ 4. Auth & Security
+purejwt.lua: lightweight, file-backed JWT system (with refresh tokens)
+
+Middleware: jwt_protect.lua, rate_limiting_middleware.lua, session_middleware.lua
+
+Token rotation, revocation, and token_store.lua pluggable backends
+
+✅ 5. WebSockets
+dawn_sockets.lua: Phoenix-style channel system
+
+Presence tracking via presence_interface.lua
+
+Modular event hooks, ack support, rooms, binary data
+
+In-memory and Redis-ready pub/sub support

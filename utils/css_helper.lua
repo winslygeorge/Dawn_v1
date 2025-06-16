@@ -2,7 +2,7 @@
 
 -- It's good practice to define external dependencies clearly.
 -- Assuming 'server.auth.sha256' exists and provides a sha256_hex function.
-local sha256 = require("server.auth.sha256")
+local sha256 = require("auth.sha256")
 
 local css_helper = {}
 

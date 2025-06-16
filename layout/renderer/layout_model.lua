@@ -2,9 +2,6 @@
 --- Base class for all layout renderer models with controller integration and Lustache rendering.
 --- Supports automatic lifecycle execution, named hooks, coroutine compatibility, and error logging.
 
-local renderer = require("layout.renderer.lustache_renderer")
-local home_controller = require("controllers.home_controller")
-
 local Model = {}
 
 --- Creates a new instance of a model.

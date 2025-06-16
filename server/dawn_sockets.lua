@@ -1,10 +1,6 @@
 -- dawn_sockets.lua (Enhanced with Phoenix-style Presence + Lifecycle + Timeout + Modular Events + Ack + Binary + Dynamic Rooms + Message Queuing)
-local Supervisor = require("runtime.loop")
 local uv = require("luv")
-local cjson = require("cjson")
-local Set = require('utils.set')
-local state_management = require('websockets.state_management._index')
-local handlers = require('websockets.handlers._index')
+local cjson = require("dkjson")
 local uuid = require('utils.uuid')
 local log_level = require('utils.logger').LogLevel
 
@@ -36,12 +32,12 @@ function DawnSockets:new(parent_supervisor, shared_state, options)
         pending_acknowledgements = {} -- Store pending acknowledgements (ws_id -> message_id -> callback)
     }
     self.logger = self.supervisor.logger
-    self.handlers = handlers or {}
+    self.handlers = options.handlers or {}
     self.connections = {}
 
     -- Use the provided state_management or default to InMemoryBackend
-    self.state_management =  state_management["__active__"] and state_management["__active__"] or state_management["__default__"]
-    self.state_management = self.state_management or state_management["__default__"]:new()
+    self.state_management =  options.state.state_management["__active__"] and options.state.state_management["__active__"] or options.state.state_management["__default__"]
+    self.state_management = self.state_management or options.state.state_management["__default__"]:new()
     self.state_management:init(options.state_management or {})
 
     self.shared.sockets = self

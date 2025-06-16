@@ -1,6 +1,6 @@
 -- utils/token_store_file.lua
 
-local json = require("cjson.safe")
+local json = require("dkjson")
 local jwt = require("auth.purejwt")
 local path = "refresh_tokens.json"
 

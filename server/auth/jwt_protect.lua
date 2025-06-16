@@ -1,7 +1,7 @@
 -- auth/jwt_protect.lua
 
 local jwt = require("auth.purejwt")
-local cjson = require("cjson")
+local cjson = require("dkjson")
 
 return function(options)
     assert(options and options.secret, "JWT middleware requires a 'secret'")

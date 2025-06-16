@@ -14,8 +14,8 @@
 -- @see lustache_renderer
 --
 
-local viewEngine = require("lustache_renderer")
-local cjson = require("cjson.safe")
+local viewEngine = require("layout.renderer.lustache_renderer")
+local cjson = require("dkjson")
 
 local Controller = {}
 

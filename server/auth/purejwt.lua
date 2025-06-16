@@ -1,7 +1,7 @@
 -- utils/purejwt.lua
 local M = {}
 local bit = require("bit") -- LuaJIT/5.1-compatible bit library
-local json = require("cjson.safe") -- works in LuaJIT / 5.1
+local json = require("dkjson") -- works in LuaJIT / 5.1
 local sha2 = require("auth.sha256")
 
 -- Helpers

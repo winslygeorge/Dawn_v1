@@ -2,7 +2,7 @@
 
 local jwt = require("auth.purejwt")
 local store = require("auth.token_store")
-local cjson = require("cjson")
+local cjson = require("dkjson")
 
 return function(options)
     assert(options and options.secret, "Refresh handler requires a 'secret'")

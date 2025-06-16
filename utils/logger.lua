@@ -1,6 +1,6 @@
 local ffi = require("ffi")
 local uv = require("luv")
-local cjson = require("cjson.safe")
+local cjson = require("dkjson")
 
 ffi.cdef[[
     int getpid();

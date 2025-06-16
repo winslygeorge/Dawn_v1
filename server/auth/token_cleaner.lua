@@ -13,7 +13,7 @@ function TokenCleaner:start()
     self.scheduler:add_task(
         "token_cleanup",
         function()
-            local count = require("utils.token_store_file").cleanup_all()
+            local count = require("auth.token_store").cleanup_all()
             if count > 0 then
                 print("[TokenCleaner] Removed " .. count .. " expired token(s).")
             end
